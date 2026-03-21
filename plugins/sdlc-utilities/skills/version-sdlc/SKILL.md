@@ -2,6 +2,7 @@
 name: version-sdlc
 description: "Use this skill when bumping a project version, creating a git release tag, generating a changelog, or performing a full semantic release workflow, updating an existing changelog entry for the current version. Consumes pre-computed context from version-prepare.js and handles the complete release process. Use --changelog without a bump type to update the changelog for the already-tagged current version. Arguments: [major|minor|patch] [--init] [--pre <label>] [--no-push] [--changelog] [--hotfix]. Triggers on: version bump, create release, bump version, tag release, generate changelog, semantic versioning, semver bump, pre-release, release candidate."
 user-invocable: true
+argument-hint: "[major|minor|patch] [--pre <label>] [--changelog] [--hotfix]"
 ---
 
 # Versioning Releases Skill
@@ -21,6 +22,15 @@ optional CHANGELOG entry, release commit, and push to origin.
 - Updating a CHANGELOG entry for an already-tagged release (e.g., after a squash merge added commits not captured in the original entry)
 
 ## Workflow
+
+## Step 0 — Plan Mode Check
+
+If the system context contains "Plan mode is active":
+
+1. Announce: "This skill requires write operations (git tag, git push). Exit plan mode first, then re-invoke `/version-sdlc`."
+2. Stop. Do not proceed to subsequent steps.
+
+---
 
 ### Step 0: Resolve and Run version-prepare.js
 
@@ -47,23 +57,20 @@ rm -f "$VERSION_CONTEXT_FILE"
 - Exit code 1: The JSON still contains an `errors` array. Show each error to the user and stop.
 - Exit code 2: Show `Script error — see output above` and stop.
 
-**Error-to-GitHub issue proposal**:
-
-For exit code 2 (script crash), locate the procedure: Glob for `**/error-report-sdlc/REFERENCE.md`
-under `~/.claude/plugins`, then retry with cwd. If found, follow the procedure with:
-
-- **Skill**: version-sdlc
-- **Step**: Step 0 — version-prepare.js execution
-- **Operation**: Running version-prepare.js to pre-compute release context
-- **Error**: Exit code 2 — script crash (full error on stderr)
-- **Suggested investigation**: Check Node.js version; inspect stderr for stack trace; verify version-prepare.js is accessible via the plugin path
-
-If not found, skip — the capability is not installed.
+**On script crash (exit 2):** Invoke error-report-sdlc — Glob `**/error-report-sdlc/REFERENCE.md`, follow with skill=version-sdlc, step=Step 0 — version-prepare.js execution, error=stderr.
 
 **If `VERSION_CONTEXT_JSON.errors` is non-empty**, show each error message and stop.
 
 **If `VERSION_CONTEXT_JSON.warnings` is non-empty**, show the warnings to the user before continuing.
-For the warning `"You have uncommitted changes"`, ask the user to confirm they want to proceed.
+For the warning `"You have uncommitted changes"`, use AskUserQuestion to ask:
+> You have uncommitted changes that will NOT be included in this release.
+
+Options:
+- **proceed** — release without the uncommitted changes
+- **commit first** — run /commit-sdlc to commit changes, then re-invoke /version-sdlc
+- **cancel** — abort the release
+
+On **commit first**: invoke `/commit-sdlc` via the Skill tool. After the commit completes, re-invoke `/version-sdlc` with the same original arguments.
 
 ---
 
@@ -140,7 +147,7 @@ Fix each issue found in Step 3. Continue until all gates pass (max 2 iterations 
 
 ### Step 5 (DO): Present Release Plan for Approval
 
-Show the full release plan to the user. **Do not execute any git commands before receiving explicit user approval.**
+Show the full release plan to the user. **Do not execute any git commands before receiving explicit user approval via AskUserQuestion.**
 
 ```
 Release Plan
@@ -153,10 +160,13 @@ Changelog:  no
 Hotfix:     yes             ← only shown when flags.hotfix === true
 ────────────────────────────────────────────
 
-Proceed? (yes / edit / cancel)
-  yes    — execute all steps
-  edit   — describe what to change
-  cancel — abort
+Use AskUserQuestion to ask:
+> Execute this release?
+
+Options:
+- **yes** — execute all steps
+- **edit** — describe what to change
+- **cancel** — abort
 ```
 
 If changelog is enabled, show the draft CHANGELOG entry between the release plan table and the prompt.
@@ -190,9 +200,10 @@ This ensures projects that ran `--init` in a prior session get notified about im
 1. Check retag scripts — same version check as described in Branch A Step 4 (retag script version check).
 2. If `config.changelog === true`: check check-changelog scripts — same version check as described in Branch A Step 4 (changelog script version check).
 3. If any scripts are outdated or missing (and `config.changelog === true` for the check-changelog check):
-   - Show the update prompt with what changed
+   - Show what changed and which files would be updated
+   - Use AskUserQuestion to ask: "Update CI scripts? (yes / no) — this does not block the release."
    - On `yes`: scaffold/overwrite the outdated files
-   - On `no`: warn and continue with the release — this check is non-blocking
+   - On `no`: warn and continue with the release
 
 The release proceeds regardless of the user's answer. This is informational, not a gate.
 
@@ -216,18 +227,7 @@ The release proceeds regardless of the user's answer. This is informational, not
 
 **If any git command fails** (commit, tag, or push) with a non-auth error, show the error.
 
-**Error-to-GitHub issue proposal**:
-
-Locate the procedure: Glob for `**/error-report-sdlc/REFERENCE.md` under `~/.claude/plugins`,
-then retry with cwd. If found, follow the procedure with:
-
-- **Skill**: version-sdlc
-- **Step**: Step 8 — Release execution
-- **Operation**: Git commit, tag, or push during release
-- **Error**: Git command failure (full error from above)
-- **Suggested investigation**: Check remote connectivity, verify tag does not already exist, confirm git identity is configured
-
-If not found, skip — the capability is not installed.
+**On script crash (exit 2):** Invoke error-report-sdlc — Glob `**/error-report-sdlc/REFERENCE.md`, follow with skill=version-sdlc, step=Step 8 — Release execution, error=git command failure message.
 
 Display result:
 
@@ -349,19 +349,10 @@ Record entries for: project-specific version file locations, non-standard tag co
 monorepo versioning patterns, CI requirements that gate tag pushes, or any edge cases
 encountered during release execution.
 
-## Workflow Continuation
+## What's Next
 
-After the release is complete, present the user with available next actions:
-
-```
-What would you like to do next?
-  jira     — update Jira ticket status (/jira-sdlc)
-  done     — stop here
-
-Select:
-```
-
-On selection, invoke the chosen skill using the Skill tool. On "done", end without further action.
+After completing the release, common follow-ups include:
+- `/jira-sdlc` — update Jira ticket status
 
 ## See Also
 

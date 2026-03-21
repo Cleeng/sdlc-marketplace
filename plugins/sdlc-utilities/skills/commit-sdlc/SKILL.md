@@ -2,7 +2,10 @@
 name: commit-sdlc
 description: "Use this skill when committing staged changes, creating a git commit, or generating a commit message. Analyzes staged diff and recent commit history to generate a message matching the project's style. Stashes unstaged changes to isolate the commit, commits after user confirmation, and auto-restores the stash. Arguments: [--no-stash] [--scope <scope>] [--type <type>] [--amend]. Triggers on: commit changes, create commit, write commit message, git commit, smart commit, commit staged, stage and commit."
 user-invocable: true
+argument-hint: "[--no-stash] [--scope <scope>] [--type <type>] [--amend]"
+model: haiku
 ---
+
 
 # Smart Commit Skill
 
@@ -18,6 +21,15 @@ confirmation, and auto-restore the stash.
 - Amending the most recent commit with updated staged changes
 
 ## Workflow
+
+## Step 0 — Plan Mode Check
+
+If the system context contains "Plan mode is active":
+
+1. Announce: "This skill requires write operations (git commit). Exit plan mode first, then re-invoke `/commit-sdlc`."
+2. Stop. Do not proceed to subsequent steps.
+
+---
 
 ### Step 0: Resolve and Run commit-prepare.js
 
@@ -44,18 +56,7 @@ rm -f "$COMMIT_CONTEXT_FILE"
 - Exit code 1: The JSON still contains an `errors` array. Show each error to the user and stop.
 - Exit code 2: Show `Script error — see output above` and stop.
 
-**Error-to-GitHub issue proposal**:
-
-For exit code 2 (script crash), locate the procedure: Glob for `**/error-report-sdlc/REFERENCE.md`
-under `~/.claude/plugins`, then retry with cwd. If found, follow the procedure with:
-
-- **Skill**: commit-sdlc
-- **Step**: Step 0 — commit-prepare.js execution
-- **Operation**: Running commit-prepare.js to pre-compute commit context
-- **Error**: Exit code 2 — script crash (full error on stderr)
-- **Suggested investigation**: Check Node.js version; inspect stderr for stack trace; verify commit-prepare.js is accessible via the plugin path
-
-If not found, skip — the capability is not installed.
+**On script crash (exit 2):** Invoke error-report-sdlc — Glob `**/error-report-sdlc/REFERENCE.md`, follow with skill=commit-sdlc, step=Step 0 — commit-prepare.js execution, error=stderr.
 
 **If `COMMIT_CONTEXT_JSON.errors` is non-empty**, show each error message and stop.
 
@@ -90,6 +91,7 @@ Extract these fields from `COMMIT_CONTEXT_JSON`:
    - Capitalization conventions?
 3. If `flags.type` is set, use it as the commit type. If not, infer from the nature of the change.
 4. If `flags.scope` is set, use it as the scope. If not, infer from the changed files or omit.
+4a. **OpenSpec scope hint (optional):** If `flags.scope` is not set, Glob for `openspec/config.yaml`. If found, Glob `openspec/changes/*/proposal.md` (exclude `archive/`). If exactly one active change exists, or one matches the current branch name, use the change directory name as a candidate scope (e.g., change `add-dark-mode` → scope `add-dark-mode`). This is a hint only — the style detected from `recentCommits` in step 2 takes precedence. If recent commits don't use scopes, do not force one.
 5. If `flags.amend` and `lastCommitMessage` is non-null, use it as the starting point — revise based on staged diff.
 6. Draft subject line (max 72 chars) and optional body:
    - Subject: imperative mood, concise, no trailing period
@@ -105,7 +107,7 @@ Fix each issue found in Step 3. Max 2 iterations per gate.
 
 ### Step 5 (DO): Present and Execute
 
-Show the full commit plan to the user. **Do not execute any git commands before receiving explicit user approval.**
+Show the full commit plan to the user. **Do not execute any git commands before receiving explicit user approval via AskUserQuestion.**
 
 ```
 Commit
@@ -123,11 +125,15 @@ Staged:     3 files changed, +142, -12
 Stash:      2 unstaged files will be stashed and restored
 ────────────────────────────────────────────
 
-Commit? (yes / edit / cancel)
-  yes    — commit as shown
-  edit   — tell me what to change
-  cancel — abort
 ```
+
+Use AskUserQuestion to ask:
+> Commit as shown?
+
+Options:
+- **yes** — commit as shown
+- **edit** — tell me what to change
+- **cancel** — abort
 
 Omit the `Stash:` line if `unstaged.hasChanges` is false or `flags.noStash` is true.
 Show `Amend:` instead of `Commit:` heading when `flags.amend` is true.
@@ -239,20 +245,11 @@ After completing a commit, if the project's detected commit style was non-conven
 <what was learned about this project's commit style or any edge case encountered>
 ```
 
-## Workflow Continuation
+## What's Next
 
-After Step 6 verification completes successfully, present the user with available next actions:
-
-```
-What would you like to do next?
-  pr       — create a pull request (/pr-sdlc)
-  version  — tag a release (/version-sdlc)
-  done     — stop here
-
-Select:
-```
-
-On selection, invoke the chosen skill using the Skill tool. On "done", end without further action.
+After completing the commit, common follow-ups include:
+- `/pr-sdlc` — create a pull request
+- `/version-sdlc` — tag a release
 
 ## See Also
 

@@ -1,7 +1,8 @@
 ---
 name: execute-plan-sdlc
-description: "Use when the user wants to execute an implementation plan with adaptive intelligence — classifies tasks by complexity and risk, builds optimized dependency waves, critiques wave structure before dispatch, verifies results after each wave, and recovers from failures without stopping. Self-contained: no external sub-skills required. Triggers on: execute plan, run plan, implement plan, autonomous execution, execute this plan."
+description: "Use when the user wants to execute an implementation plan with adaptive intelligence — classifies tasks by complexity and risk, builds optimized dependency waves, critiques wave structure before dispatch, verifies results after each wave, and recovers from failures without stopping. Self-contained: no external sub-skills required. Triggers on: execute plan, run plan, implement plan, autonomous execution, execute this plan. Also auto-triggered when the user accepts a plan from plan-sdlc (plan content is already in conversation context)."
 user-invocable: true
+argument-hint: "[plan-file-path] [--preset A|B|C]"
 ---
 
 # Execute Plan (SDLC)
@@ -9,6 +10,15 @@ user-invocable: true
 Orchestrate plan execution with adaptive task classification, wave-based parallel dispatch, PCIDCI critique loops, and automatic error recovery. No external sub-skills required.
 
 **Announce at start:** "I'm using the execute-plan-sdlc skill."
+
+## Plan Mode Check
+
+If the system context contains "Plan mode is active":
+
+1. Announce: "This skill requires write operations (file edits, shell commands). Exit plan mode first, then re-invoke `/execute-plan-sdlc`."
+2. Stop. Do not proceed to subsequent steps.
+
+---
 
 ## Step 0: Prerequisites
 
@@ -34,9 +44,17 @@ Once the plan content is available, validate it:
 
 Blocking issues → stop and ask. Warnings only → show them and proceed.
 
+**OpenSpec context loading (optional):** After the plan is loaded, check the plan header's `**Source:**` field. If it points to an `openspec/changes/<name>/` path, Read all markdown files matching `openspec/changes/<name>/specs/*.md` (the delta specs). Store these as `openspecSpecs` for use in Step 5c-bis. If the path does not exist or yields no files, proceed without OpenSpec context — this is not a blocking error.
+
 **Checkpoint detection:** Before reading the plan content, check for an existing checkpoint file at `$TMPDIR/claude-exec/<plan-name>-checkpoint.md` (where `<plan-name>` is derived from the plan filename or first 20 characters of the plan title). If found, display:
-> Found execution checkpoint from <timestamp>. Resume from Wave <N>? (yes / restart)
-Wait for explicit user response. If "yes", skip to the checkpoint's "Next" wave. If "restart", proceed normally from Step 2.
+Use AskUserQuestion to ask:
+> Found execution checkpoint from <timestamp>. Resume from Wave <N>?
+
+Options:
+- **yes** — resume from where execution left off
+- **restart** — discard checkpoint and start from the beginning
+
+If "yes", skip to the checkpoint's "Next" wave. If "restart", proceed normally from Step 2.
 
 ## Step 2 (CLASSIFY): Classify Tasks and Build Waves
 
@@ -59,9 +77,9 @@ For each task, determine three things:
 - **Standard** → `sonnet` — capable, cost-efficient
 - **Complex** → `opus` — most capable, required for architectural and cross-cutting work
 
-The user selects a preset in Step 4 that applies these mappings (or overrides them). See `./classifying-and-waving-tasks.md` for override signals.
+The user selects a preset in Step 4 that applies these mappings (or overrides them).
 
-Build waves from the dependency graph. See `./classifying-and-waving-tasks.md` for full heuristics, wave-building algorithm, and adaptive sizing table.
+After classification, Read `./classifying-and-waving-tasks.md` for wave-building algorithm and adaptive sizing.
 
 Two tasks modifying the same file must be in different waves.
 
@@ -123,7 +141,10 @@ Model Presets:
   B) Balanced:  N × haiku, N × sonnet, N × opus    — default ✓
   C) Quality:   N × sonnet, N × opus                — max correctness
 
-Select preset (A/B/C), "custom" to edit individual tasks, or "cancel":
+Use AskUserQuestion to select a preset:
+> Select execution preset
+
+Options: **A** (Speed) | **B** (Balanced, default) | **C** (Quality) | **custom** | **cancel**
 Tip: Use --preset B to skip this prompt next time.
 ```
 
@@ -135,12 +156,16 @@ Always present all 3 presets. Default is Balanced. When the user selects a prese
 
 **For each wave:**
 
-**5a. High-risk gate** — If the wave contains high-risk tasks, show what will be done and wait:
-```
-Wave N contains high-risk task(s):
-  - Task N: "..." [HIGH RISK: database change]
-Approve? (yes / skip / cancel)
-```
+**5a. High-risk gate** — If the wave contains high-risk tasks, use AskUserQuestion to ask:
+> Wave N contains high-risk task(s):
+> - Task N: "..." [HIGH RISK: database change]
+>
+> Approve execution?
+
+Options:
+- **yes** — execute this wave
+- **skip** — skip high-risk tasks, continue with remaining waves
+- **cancel** — stop execution entirely
 
 **5b. Dispatch agents** — One agent per standard/complex task, all in a single message (parallel). If the wave contains 2+ trivial tasks, include one additional batch agent (haiku) dispatched alongside the others using the Batched Trivial Tasks Prompt Template in `./classifying-and-waving-tasks.md`. A single trivial in a wave is executed inline before dispatch. Each agent prompt must include:
 - Full task text (never a reference to the plan file — paste the entire task body)
@@ -182,7 +207,7 @@ Approve? (yes / skip / cancel)
 
 Skip for waves containing only Trivial tasks. Skip if the Speed preset was selected.
 
-After mechanical verification passes (Steps 5c.1–4), dispatch a single spec compliance reviewer (sonnet) using the prompt template in `./spec-compliance-reviewer.md`. Provide:
+After mechanical verification passes (Steps 5c.1–4), dispatch a single spec compliance reviewer (sonnet). At dispatch time, Read `./spec-compliance-reviewer.md` and use it as the prompt template. Provide:
 - Each non-trivial task's full specification text
 - The files each agent's completion checklist listed as modified
 
@@ -225,12 +250,13 @@ Preset: <selected preset>
 - Did any task's actual output differ from what upcoming tasks assumed as input?
 - Did any task change an interface that downstream tasks depend on?
 - If yes, update the next wave's task descriptions to reflect the actual (not planned) outputs.
+- When `openspecSpecs` is available: did any task's implementation contradict an OpenSpec delta spec requirement that was not explicitly captured in the task description? If so, flag it before proceeding to the next wave.
 
 **Context management** — Between waves, check context usage. If high, compact before dispatching the next wave: summarize completed wave results into a compact status block and discard the verbose agent output. This prevents context exhaustion on plans with 4+ waves.
 
 ## Step 6 (RECOVER): Error Recovery
 
-See `./recovering-from-failures.md` for the full playbook. Summary:
+**On failure:** Read `./recovering-from-failures.md` for the full playbook. Do not read this file preemptively — only when a failure occurs in this step. Summary:
 
 | Failure Type | Recovery Action |
 |---|---|
@@ -242,7 +268,7 @@ See `./recovering-from-failures.md` for the full playbook. Summary:
 | Test failure (3+ tests) | Stop; diagnose root cause before proceeding |
 | Build failure | Stop immediately; fix before next wave |
 | Lint failure | Fix inline; never block a wave on lint-only failures |
-| Phantom success (agent reports done, files unchanged) | Re-dispatch with model escalation and Edit-tool-only constraint; see recovering-from-failures.md |
+| Phantom success (agent reports done, files unchanged) | Re-dispatch with model escalation and Edit-tool-only constraint; see `./recovering-from-failures.md` (read on failure only) |
 | Persistent failure (2+ retries) | Escalate to user with full context |
 | Agent status: NEEDS_CONTEXT | Provide missing context, re-dispatch (counts as retry) |
 | Agent status: BLOCKED | Assess blocker: provide context + re-dispatch, escalate model, break task, or escalate to user |
@@ -369,21 +395,12 @@ Format:
 <what happened, what was learned>
 ```
 
-## Workflow Continuation
+## What's Next
 
-After completing Step 9 and presenting the execution summary, present the user with available next actions:
-
-```
-What would you like to do next?
-  commit   — commit the changes (/commit-sdlc)
-  pr       — create a pull request (/pr-sdlc)
-  review   — review the changes (/review-sdlc)
-  done     — stop here
-
-Select:
-```
-
-On selection, invoke the chosen skill using the Skill tool. On "done", end without further action.
+After completing plan execution, common follow-ups include:
+- `/commit-sdlc` — commit the changes
+- `/pr-sdlc` — create a pull request
+- `/review-sdlc` — review the changes
 
 ## See Also
 

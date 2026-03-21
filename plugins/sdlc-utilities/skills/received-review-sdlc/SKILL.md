@@ -2,6 +2,7 @@
 name: received-review-sdlc
 description: "Use this skill when responding to code review feedback on a pull request or inline reviewer comments. Covers reading, verifying, evaluating, and responding to reviewer comments with a dual self-critique gate — prevents performative agreement and ensures technical rigor. Can be launched manually or automatically after /review-sdlc. Triggers on: process review feedback, respond to review, handle review comments, address PR feedback, fix review findings, received-review."
 user-invocable: true
+argument-hint: "[PR-URL or PR-number]"
 ---
 
 # Responding to Code Review Feedback
@@ -10,6 +11,15 @@ Process reviewer comments with technical rigor. Each item is verified against th
 codebase context — not just the change diff — before any response is drafted. Internal
 self-critique gates ensure quality. No changes are made until the user explicitly approves
 the proposed action plan.
+
+---
+
+## Step 0 — Plan Mode Check
+
+If the system context contains "Plan mode is active":
+
+1. Announce: "This skill requires write operations (file edits, gh api calls). Exit plan mode first, then re-invoke `/received-review-sdlc`."
+2. Stop. Do not proceed to subsequent steps.
 
 ---
 
@@ -217,21 +227,18 @@ Show the full text of each drafted response, labeled by item number.
 
 **4. Consent gate:**
 
-```
-No changes have been made yet.
+Use AskUserQuestion to ask:
+> No changes have been made yet. How to proceed?
 
-How to proceed? (implement / edit / skip)
-  implement — post responses to PR and apply code changes
-  edit      — modify the plan before proceeding
-  skip      — discard, make no changes
+Options:
+- **implement** — post responses to PR and apply code changes
+- **edit** — modify the plan before proceeding
+- **skip** — discard, make no changes
 
-Select:
-```
+If the user chooses **edit**, ask what to change, revise, and present again.
+Loop until explicit **implement** or **skip**.
 
-If the user chooses `edit`, ask what to change, revise, and present again.
-Loop until explicit `implement` or `skip`.
-
-**Do NOT proceed to Step 11 without explicit `implement` from the user.**
+**Do NOT proceed to Step 11 without explicit `implement` from the user via AskUserQuestion.**
 
 ---
 
@@ -331,19 +338,10 @@ facts uncovered during verification.
 
 ---
 
-## Workflow Continuation
+## What's Next
 
-After implementing the accepted fixes (Step 11), present the user with available next actions:
-
-```
-What would you like to do next?
-  commit   — commit the fixes (/commit-sdlc)
-  done     — stop here
-
-Select:
-```
-
-On selection, invoke the chosen skill using the Skill tool. On "done", end without further action.
+After implementing the accepted fixes, common follow-ups include:
+- `/commit-sdlc` — commit the fixes
 
 ## See Also
 

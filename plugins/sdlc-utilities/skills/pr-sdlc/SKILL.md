@@ -2,12 +2,22 @@
 name: pr-sdlc
 description: "Use this skill when creating or updating a pull request, updating a PR description, or generating PR content from commits and diffs. Handles the full PR workflow: consumes pre-computed context from pr-prepare.js, generates description with plan-critique-improve-do-critique-improve, user review, and gh CLI execution. Arguments: [--draft] [--update] [--base <branch>]. Triggers on: create PR, open pull request, update PR, write PR description, PR summary, describe changes for a pull request."
 user-invocable: true
+argument-hint: "[--draft] [--update] [--base <branch>]"
 ---
 
 # Creating Pull Requests
 
 Consume pre-computed git context from `pr-prepare.js` and generate an 8-section
 PR description readable by both technical and non-technical stakeholders.
+
+## Step 0 — Plan Mode Check
+
+If the system context contains "Plan mode is active":
+
+1. Announce: "This skill requires write operations (gh pr create/edit). Exit plan mode first, then re-invoke `/pr-sdlc`."
+2. Stop. Do not proceed to subsequent steps.
+
+---
 
 ## When to Use This Skill
 
@@ -102,23 +112,12 @@ rm -f "$PR_CONTEXT_FILE"
 - Exit code 1: The JSON still contains an `errors` array. Show each error to the user and stop.
 - Exit code 2: Show `Script error — see output above` and stop.
 
-**Error-to-GitHub issue proposal**:
-
-For exit code 2 (script crash), locate the procedure: Glob for `**/error-report-sdlc/REFERENCE.md`
-under `~/.claude/plugins`, then retry with cwd. If found, follow the procedure with:
-
-- **Skill**: pr-sdlc
-- **Step**: Step 0 — pr-prepare.js execution
-- **Operation**: Running pr-prepare.js to pre-compute PR context
-- **Error**: Exit code 2 — script crash (full error on stderr)
-- **Suggested investigation**: Check Node.js version; inspect stderr for stack trace; verify pr-prepare.js is accessible via the plugin path
-
-If not found, skip — the capability is not installed.
+**On script crash (exit 2):** Invoke error-report-sdlc — Glob `**/error-report-sdlc/REFERENCE.md`, follow with skill=pr-sdlc, step=Step 0 — pr-prepare.js execution, error=stderr.
 
 **If `PR_CONTEXT_JSON.errors` is non-empty**, show each error message and stop.
 
-**If `PR_CONTEXT_JSON.warnings` is non-empty**, show the warnings to the user before continuing.
-Ask them to confirm if they want to proceed (particularly for uncommitted changes).
+**If `PR_CONTEXT_JSON.warnings` is non-empty**, show the warnings prominently before continuing.
+Do not ask for confirmation — the Step 5 approval gate (AskUserQuestion) is the consent point before PR creation.
 
 **If `PR_CONTEXT_JSON.ghAuth` is not null**, inform the user before continuing (no confirmation needed):
 
@@ -156,11 +155,22 @@ Key fields available (including `customTemplate` added for project-level PR temp
 
 Using data from `PR_CONTEXT_JSON`, draft all sections of the active PR template (custom sections if `customTemplate` is present, or the default 8 sections below).
 
+**OpenSpec enrichment (automatic when detected):**
+
+1. Glob for `openspec/config.yaml`. If absent, skip this block entirely.
+2. Identify the active change: Glob `openspec/changes/*/proposal.md` (exclude `archive/`). If one matches, use it. If multiple, match against `PR_CONTEXT_JSON.currentBranch`. If ambiguous, skip — do not ask during PR creation.
+3. If an active change is found, Read in parallel:
+   - `proposal.md` — use intent and scope to pre-fill **Business Context** and **Business Benefits** (reduces need for AskUserQuestion clarification)
+   - `design.md` (if exists) — use architectural approach for **Technical Design** section
+4. Add to the PR description, below the title: `**OpenSpec:** openspec/changes/<name>/`
+
+When OpenSpec context provides business rationale, use it directly instead of asking the user. Still ask if the proposal is too vague to fill Business Context/Benefits confidently.
+
 For each section, apply the fill rules:
 
 - **Summary**: Plain-language, no jargon, 1-3 sentences
 - **JIRA Ticket**: Use `context.jiraTicket` or "Not detected"
-- **Business Context / Benefits**: Infer from `context.commits` and `context.diffContent`. If insufficient evidence, **ask the user** before writing. Don't guess. Acceptable question: *"What business problem does this PR solve? Who benefits and how?"*
+- **Business Context / Benefits**: Infer from `context.commits` and `context.diffContent`. If insufficient evidence, **use AskUserQuestion** to ask the user before writing. Don't guess. Acceptable question: *"What business problem does this PR solve? Who benefits and how?"*
 - **Technical Design**: Infer from `context.diffContent` — architecture, patterns, key decisions
 - **Technical Impact**: Identify affected systems/APIs/services from the diff
 - **Changes Overview**: Group by logical concern, no file paths
@@ -199,7 +209,7 @@ Fix each issue found in Step 3:
 - Rewrite vague sections with specifics from the diff
 - Replace invented content with "N/A" or "Not detected" plus a note
 - If a business section still can't be filled confidently after revision,
-  **ask the user** a targeted clarifying question and incorporate the answer
+  **use AskUserQuestion** to ask a targeted clarifying question and incorporate the answer
 - Re-check all quality gates after revisions
 
 Continue until all gates pass (max 2 iterations per gate).
@@ -207,7 +217,7 @@ Continue until all gates pass (max 2 iterations per gate).
 ### Step 5 (DO): Present for Review
 
 Show the complete title and description. **Do not execute any `gh` command
-before receiving explicit user approval.**
+before receiving explicit user approval via AskUserQuestion.**
 
 ```text
 PR Title: <title>
@@ -217,17 +227,15 @@ PR Description:
 <full description>
 ─────────────────────────────────────────────
 
-<if mode = create>
-Create this PR? (yes / edit / cancel)
-  yes    — create the PR as shown
-  edit   — tell me what to change
-  cancel — abort without creating
+Use AskUserQuestion to ask (adapt question to mode):
 
-<if mode = update>
-Update PR #<number>? (yes / edit / cancel)
-  yes    — update the PR title and description as shown
-  edit   — tell me what to change
-  cancel — abort without updating
+For create mode:
+> Create this PR as shown?
+Options: **yes** — create the PR | **edit** — tell me what to change | **cancel** — abort
+
+For update mode:
+> Update PR #<number> as shown?
+Options: **yes** — update the PR | **edit** — tell me what to change | **cancel** — abort
 ```
 
 If the user chooses `edit`, ask what to change, revise, and present again.
@@ -273,19 +281,7 @@ Title: <title>
 <description>
 ```
 
-**Error-to-GitHub issue proposal**:
-
-For non-auth `gh` failures (e.g., server error, unexpected exit), locate the procedure:
-Glob for `**/error-report-sdlc/REFERENCE.md` under `~/.claude/plugins`, then retry with cwd.
-If found, follow the procedure with:
-
-- **Skill**: pr-sdlc
-- **Step**: Step 6 — Create or Update PR
-- **Operation**: Running `gh pr create` or `gh pr edit`
-- **Error**: gh CLI failure (full error message from above)
-- **Suggested investigation**: Check `gh status`, verify repo permissions, check if branch is pushed to remote
-
-If not found, skip — the capability is not installed.
+**On script crash (exit 2):** Invoke error-report-sdlc — Glob `**/error-report-sdlc/REFERENCE.md`, follow with skill=pr-sdlc, step=Step 6 — Create or Update PR, error=gh CLI failure message.
 
 ---
 
@@ -356,6 +352,8 @@ When invoking `error-report-sdlc`, provide:
   `gh auth switch --user <login>` manually before invoking the skill. The switch persists for
   subsequent commands.
 
+- **OpenSpec change detection during PR creation should not block.** Unlike plan-sdlc which can ask the user to disambiguate multiple active changes, pr-sdlc should silently skip OpenSpec enrichment if the change cannot be uniquely identified from the branch name. PR creation should never be blocked by spec detection ambiguity.
+
 ## Learning Capture
 
 When creating pull requests, capture discoveries by appending to `.claude/learnings/log.md`.
@@ -363,20 +361,11 @@ Record entries for: repository PR conventions not covered by this skill, branch 
 patterns, CI requirements that affect PR descriptions, team-specific template preferences,
 JIRA project key patterns, or review process quirks encountered while generating PR content.
 
-## Workflow Continuation
+## What's Next
 
-After the PR is created or updated, present the user with available next actions:
-
-```
-What would you like to do next?
-  review   — review the branch (/review-sdlc)
-  version  — tag a release after merge (/version-sdlc)
-  done     — stop here
-
-Select:
-```
-
-On selection, invoke the chosen skill using the Skill tool. On "done", end without further action.
+After creating or updating the PR, common follow-ups include:
+- `/review-sdlc` — review the branch
+- `/version-sdlc` — tag a release after merge
 
 ## See Also
 

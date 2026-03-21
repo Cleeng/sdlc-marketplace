@@ -2,6 +2,7 @@
 name: jira-sdlc
 description: "Use this skill when creating, editing, searching, transitioning, commenting on, or linking Jira issues using Atlassian MCP tools. Caches project metadata (custom fields, workflows, transitions, user mappings) to eliminate redundant discovery calls. Uses per-issue-type description templates (customizable per project). Arguments: [--project <KEY>] [--force-refresh] [--init-templates]. Triggers on: create jira issue, edit jira ticket, search jira, transition jira, jira comment, link jira, assign jira, log work jira, bulk jira operations, manage jira, jira template."
 user-invocable: true
+argument-hint: "[--project <KEY>] [--force-refresh] [--init-templates]"
 ---
 
 # Managing Jira Issues
@@ -54,7 +55,7 @@ removed entirely — the API call is never made with raw placeholder text.
 1. `--project <KEY>` argument
 2. Parse current git branch for `[A-Z]{2,10}-\d+` pattern (e.g., `feat/PROJ-123-fix` → `PROJ`)
 3. Read `.claude/jira-config.json` → `defaultProject`
-4. Ask the user: "Which Jira project key should I use?"
+4. Use AskUserQuestion to ask: "Which Jira project key should I use? (e.g., PROJ, TEAM)"
 
 ### Script Resolution Block
 
@@ -266,7 +267,7 @@ Parse user intent into one of these operations:
 | `view` | show, get, display, details of | 1 |
 | `bulk` | create N issues, multiple operations | N |
 
-For ambiguous requests, ask one clarifying question before classifying.
+For ambiguous requests, use AskUserQuestion to ask one clarifying question before classifying.
 
 ---
 
@@ -306,9 +307,9 @@ After operations that reveal new information, update the cache incrementally:
 
 | Error | Diagnosis | Recovery |
 |-------|-----------|----------|
-| 400 on create | Missing required field or wrong field shape | Check `fieldSchemas` for the issue type; cross-reference REFERENCE.md Section 2. If field key or allowed values don't match the API error, **auto-refresh**: run `--force-refresh`, reload cache, retry once |
+| 400 on create | Missing required field or wrong field shape | Verify field key/shape against the cached `fieldSchemas` object. If the field doesn't match, run `--force-refresh`, reload cache, retry once. If still failing after refresh, invoke `error-report-sdlc` |
 | 400 on transition | Missing required transition field (e.g., resolution) | Check `workflows[type].transitions[status][n].requiredFields`; include required fields. If transition ID is not recognized, **auto-refresh**: run `--force-refresh`, reload cache, retry once |
-| 400 on edit | Wrong field shape or incorrect custom field key | Verify field key spelling; check type in REFERENCE.md Section 2. If field no longer exists, **auto-refresh**: run `--force-refresh`, reload cache, retry once |
+| 400 on edit | Wrong field shape or incorrect custom field key | Verify field key/shape against the cached `fieldSchemas` object. If the field doesn't match, run `--force-refresh`, reload cache, retry once. If field format details are needed, Read `./REFERENCE.md` Section 2 only |
 | 401 | Auth token expired | Reconnect Atlassian MCP; cannot recover programmatically |
 | 403 | Insufficient permission | Report to user — cannot fix |
 | 404 issue | Issue key wrong or issue deleted | Ask user to verify the issue key |
@@ -388,20 +389,11 @@ quirks discovered in specific projects, issue type names that aren't standard (e
 subtask type names), user lookup disambiguation patterns, and transition required fields not
 captured by the workflow sampling.
 
-## Workflow Continuation
+## What's Next
 
-After completing any Jira operation, present the user with available next actions:
-
-```
-What would you like to do next?
-  plan     — write an implementation plan for this ticket (/plan-sdlc)
-  execute  — execute an existing plan (/execute-plan-sdlc)
-  done     — stop here
-
-Select:
-```
-
-Only offer `plan` when a ticket was created or read that implies implementation work. Only offer `execute` when a plan already exists in conversation context. On selection, invoke the chosen skill using the Skill tool. On "done", end without further action.
+After completing a Jira operation, common follow-ups include:
+- `/plan-sdlc` — write an implementation plan for a ticket
+- `/execute-plan-sdlc` — execute an existing plan
 
 ## See Also
 
