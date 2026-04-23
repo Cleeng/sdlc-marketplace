@@ -72,11 +72,8 @@ Clean up: `rm -f "$MANIFEST_FILE"`. Stop here.
 
 ## Step 2 — Spawn Orchestrator Agent
 
-Locate the orchestrator agent definition using Glob: `path: ~/.claude`, pattern
-`**/agents/review-orchestrator.md`. If not found, retry Glob with the default path (cwd).
-
-Spawn a single Agent (subagent_type: `sdlc:review-orchestrator`) with the orchestrator
-agent's full content as the prompt, plus this context appended:
+Spawn a single Agent using `subagent_type: sdlc:review-orchestrator` with the following
+context as the prompt:
 
 ```
 MANIFEST_FILE: {the temp file path from Step 0}
@@ -84,29 +81,104 @@ PROJECT_ROOT: {current working directory}
 ```
 
 The orchestrator will read the manifest, resolve REFERENCE.md, dispatch dimension
-subagents, critique/deduplicate, format the comment, handle PR posting, and clean up.
+subagents, critique/deduplicate, format the comment, and persist the consolidated
+comment body to `${diff_dir}/review-comment.md`. It does NOT post to a PR and does
+NOT prompt the user — the skill handles posting in Step 4.
 
 Wait for the orchestrator to return its summary.
 
 **On orchestrator failure:** Re-dispatch once with the same inputs. If the second
 attempt also fails, invoke error-report-sdlc with skill=review-sdlc,
-step=Step 2 — orchestrator dispatch, error=agent error output.
+step=Step 2 — orchestrator dispatch, error=agent error output. A failure retry counts
+as the same attempt for quality-gate G4 — user confirmation in Step 4 MUST NOT trigger
+a new orchestrator dispatch.
 
 ---
 
-## Step 3 — Report and Cleanup
+## Step 3 — Parse Orchestrator Summary
 
-Display the orchestrator's summary to the user.
+Display the orchestrator's summary to the user verbatim.
 
-Clean up the manifest temp file:
+Parse the summary to extract:
 
-```bash
-rm -f "$MANIFEST_FILE"
+- `comment_file` — absolute path to `${diff_dir}/review-comment.md`
+- `pr.exists` (boolean), `pr.owner`, `pr.repo`, `pr.number`
+- `verdict` — one of `CHANGES REQUESTED`, `APPROVED WITH NOTES`, `APPROVED`
+- `scope` — scope label from the summary
+- `branch` — current branch name
+- `diff_dir` — absolute path to the orchestrator's working diff dir
+
+Do NOT delete the manifest file here — cleanup happens in Step 6 on every terminal branch.
+
+---
+
+## Step 4 — Handle Posting
+
+This step runs entirely in the main context. It MUST NOT dispatch a new Agent, and
+MUST NOT re-invoke the orchestrator. The comment body at `comment_file` is authoritative.
+
+### PR exists (`pr.exists == true`)
+
+Prompt in the main context:
+
+```text
+Post this review comment to PR #{pr.number}? (yes / save / cancel)
+  yes    — post the comment to the PR
+  save   — save review to .claude/reviews/<branch>-<YYYY-MM-DD>.md instead
+  cancel — keep in terminal only (already shown above)
 ```
 
+Wait for the user's reply.
+
+- `yes` → post via `gh api` using the file body form (safe for large markdown, backticks, quotes):
+
+  ```bash
+  gh api repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments -F body=@{comment_file}
+  ```
+
+- `save` →
+
+  ```bash
+  BRANCH_SAFE="${branch//\//-}"
+  mkdir -p .claude/reviews
+  cp "{comment_file}" ".claude/reviews/${BRANCH_SAFE}-$(date +%Y-%m-%d).md"
+  ```
+
+- `cancel` → no action. The comment is already visible in the terminal from Step 3.
+
+### No PR, branch scope (`scope` is `all`, `committed`, or `worktree`)
+
+Prompt:
+
+```text
+No PR found. Options:
+  1. Create a draft PR and attach this review as a comment
+  2. Save review to .claude/reviews/<branch>-<YYYY-MM-DD>.md
+  3. Keep in terminal only
+```
+
+- Option 1 → invoke `pr-sdlc` from the main context in draft mode, wait for PR
+  creation, then post via the `gh api … -F body=@{comment_file}` command above using
+  the newly created PR's owner/repo/number.
+- Option 2 → same `save` command as above.
+- Option 3 → no action.
+
+### No PR, local scope (`scope` is `staged` or `working`)
+
+Prompt:
+
+```text
+Reviewing local changes — no PR to post to. Options:
+  1. Save review to .claude/reviews/<branch>-<YYYY-MM-DD>.md
+  2. Keep in terminal only
+```
+
+- Option 1 → `save` command above.
+- Option 2 → no action.
+
 ---
 
-## Step 4 — Offer Self-Fix
+## Step 5 — Offer Self-Fix
 
 If the verdict is **CHANGES REQUESTED** or **APPROVED WITH NOTES**, offer to fix:
 
@@ -119,12 +191,25 @@ If verdict is **APPROVED**: skip — nothing to fix.
 
 ---
 
+## Step 6 — Cleanup
+
+Runs on every terminal branch of Step 4 — including `cancel`, terminal-only, errors,
+and orchestrator failures. Must not be skipped.
+
+```bash
+rm -f "$MANIFEST_FILE"
+rm -rf "{diff_dir}"
+```
+
+---
+
 ## DO NOT
 
 - Do NOT read the manifest JSON into main context (the orchestrator reads it)
 - Do NOT read REFERENCE.md in main context (the orchestrator resolves it)
 - Do NOT read the orchestrator agent definition into main context — pass the file path or use the sdlc:review-orchestrator subagent_type
 - Do NOT invoke error-report-sdlc for user errors — only for script crashes (exit 2)
+- Do NOT re-dispatch the orchestrator to post the comment — use the `comment_file` from its summary
 
 ## See Also
 
