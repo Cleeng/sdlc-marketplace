@@ -86,6 +86,7 @@
 - E4: `gh` unavailable → show install instructions (no error report)
 - E5: `gh` auth failure → show `gh auth login` instructions (no error report)
 - E6: Title pattern validation fails → show error message, ask user to edit title
+- E7: `gh pr create` fails with a repo-permission error → post-flight account-switch recovery (distinct from pre-flight `ensureGhAccount`): if a local gh account matching the repo owner is found, switch to it automatically and retry `gh pr create` exactly once; the user sees a single concise recovery line and not the raw error. If no matching account exists, surface the original error with a `gh auth login` hint for the correct hostname. A second consecutive permission failure is terminal. Max one retry per pipeline invocation. References issue #184.
 
 ## Constraints
 
