@@ -32,13 +32,14 @@
 - R12: When `--auto` is set, skip AskUserQuestion prompts but display the release plan and run all critique gates
 - R13: Verify pre-conditions before execution: version file exists (file mode), tag does not conflict, no uncommitted changes, git identity configured
 - R14: Prepare script output is the single authoritative source for all contracted fields (P-fields) — script-provided values take unconditional precedence over skill-generated content, and all factual context (git state, config, flags, metadata) must originate from script output to ensure deterministic behavior
+- R15: When `remoteState.hasUpstream === false`, the push step uses `git push --set-upstream origin <currentBranch>` instead of bare `git push`; the subsequent `git push --tags` is unchanged. This avoids first-push failures on fresh feature branches.
 
 ## Workflow Phases
 
 1. CONSUME — read pre-computed context from `skill/version.js` output (current version, commits, config, flags, bump options)
    - **Script:** `skill/version.js`
    - **Params:** A1 positional bump type (`major|minor|patch`), A2-A7 forwarded (`--pre <label>`, `--changelog`, `--hotfix`, `--auto`, `--init`, `--no-push`)
-   - **Output:** JSON → P1-P12 (version source, config mode/changelog/ticket prefix, requested bump, conventional summary with suggested bump and breaking changes, bump options, latest tag, commits, flags, tag conflicts)
+   - **Output:** JSON → P1-P14 (version source, config mode/changelog/ticket prefix, requested bump, conventional summary with suggested bump and breaking changes, bump options, latest tag, commits, flags, tag conflicts, remote state, current branch)
 2. PLAN — determine bump type, compute new version, draft CHANGELOG entry if enabled
 3. CRITIQUE — self-review against all 7 quality gates
 4. IMPROVE — fix failing gates (max 2 iterations per gate)
@@ -69,6 +70,8 @@
 - P10: `commits` (array) — commits since last tag, each with optional `ticketIds`
 - P11: `flags` (object: `{ preLabel, noPush, changelog, hotfix, auto }`) — parsed CLI flags
 - P12: `conflictsWithNext` (object: `{ major, minor, patch }`) — whether each tag already exists
+- P13: `remoteState` (object: `{ hasUpstream, remoteBranch }`) — upstream tracking state for current branch; `hasUpstream` is false when no upstream is configured
+- P14: `currentBranch` (string) — name of the currently checked-out branch
 
 ## Error Handling
 
