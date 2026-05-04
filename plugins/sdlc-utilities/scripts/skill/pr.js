@@ -261,6 +261,44 @@ function main() {
     warnings.push(`Could not read PR config: ${err.message}`);
   }
 
+  // Step 10d: Validate pr.labels.rules against repoLabels (issue #197)
+  // When mode = "rules", every rule's label must exist in the repo. Unknown
+  // labels produce warnings (not errors) and are stripped from the emitted
+  // prConfig.labels.rules — same posture as forced label validation above.
+  // mode = "off" or "llm" leaves rules untouched.
+  if (prConfig && prConfig.labels && prConfig.labels.mode === 'rules' && Array.isArray(prConfig.labels.rules)) {
+    const validRules = [];
+    const knownSignals = ['branchPrefix', 'commitType', 'pathGlob', 'jiraType', 'diffSizeUnder'];
+    for (const rule of prConfig.labels.rules) {
+      if (!rule || typeof rule !== 'object' || typeof rule.label !== 'string') {
+        continue;
+      }
+      // Validate structural correctness of rule.when (implements R-labels-2)
+      if (!rule.when || typeof rule.when !== 'object') {
+        warnings.push(`Rule for label "${rule.label}" is missing a "when" condition. Rule will be ignored.`);
+        continue;
+      }
+      const whenKeys = Object.keys(rule.when);
+      if (whenKeys.length !== 1) {
+        warnings.push(`Rule for label "${rule.label}" has ${whenKeys.length === 0 ? 'no' : 'multiple'} signal keys in "when" (expected exactly 1). Rule will be ignored.`);
+        continue;
+      }
+      if (!knownSignals.includes(whenKeys[0])) {
+        warnings.push(`Rule for label "${rule.label}" uses unknown signal "${whenKeys[0]}" in "when". Valid signals: ${knownSignals.join(', ')}. Rule will be ignored.`);
+        continue;
+      }
+      if (!repoLabelNames.includes(rule.label)) {
+        warnings.push(`Label "${rule.label}" referenced in pr.labels.rules does not exist in the repo. Rule will be ignored.`);
+        continue;
+      }
+      validRules.push(rule);
+    }
+    prConfig = {
+      ...prConfig,
+      labels: { ...prConfig.labels, rules: validRules },
+    };
+  }
+
   // Step 11: Read custom PR template
   const templatePath = path.join(projectRoot, '.claude', 'pr-template.md');
   const customTemplate = fs.existsSync(templatePath)
