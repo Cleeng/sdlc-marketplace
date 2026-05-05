@@ -3,6 +3,12 @@
 Append-only learnings log for the `sdlc-marketplace` repository.
 Entries flow from incidents, debugging sessions, and evolution cycles.
 
+## 2026-05-05 — pr-sdlc: per-dimension model override PR (#199)
+PR created for feat(#199) on branch fix/199-per-dimension-model-override. Custom template active — title pattern required `type(#issue): scope - description` format. sdlc.json version mode was already switched to `tag` on this branch, affecting how version-sdlc behaves in future sessions. "Fixes #199" placed in Github Issue section (custom template field) to link the issue for auto-close on merge.
+
+## 2026-05-05 — version-sdlc: tag-mode release on feature branch with no upstream
+Tag mode project (no version file). Branch `fix/199-per-dimension-model-override` had no upstream set; Step 8 auto-healed with `--set-upstream`. Branch was already pushed so push reported "Everything up-to-date" for commits; tag pushed cleanly as new tag. Explicit `patch` bump overrode conventional `minor` suggestion (1 feat commit). No changelog configured.
+
 ## 2026-05-05 — version-sdlc: patch release v0.17.38 from fix/198-link-validation-safeguard
 Standard patch release. Two fix commits for link-validation URL validator and missing exit guards. Branch had no upstream — used `--set-upstream` on first push. CI scripts all current. No blocking issues.
 
@@ -32,3 +38,6 @@ that capture non-obvious gotchas not yet reflected in code, docs, or skills.
 ## 2026-04-29 — received-review-sdlc processing of review findings for fix(#183)
 - `not-icontains` on `--set-upstream` would match the string anywhere in the response (including explanatory text), producing false negatives on regression-guard assertions; `not-regex: 'git push.*--set-upstream'` scopes the check to actual push command lines only.
 - When adding a new behavior to version-sdlc (R15), always verify: (1) CHANGELOG entry covers the fix, (2) P-fields in spec list all script-provided values the skill uses, (3) user-facing docs describe the behavior, (4) regression-guard assertions are precise enough not to false-negative on prose mentions of flagged strings.
+
+## 2026-05-05 -- setup-sdlc: review-dimensions count mismatch
+setup.js reported reviewDimensions.count: 0 despite 12 valid .md files in .claude/review-dimensions/. Root cause: setup.js likely checks for .yaml extensions but this project uses .md. Validate script (validate-dimensions.js) correctly found all 12. Added type-safety-review as the one genuine gap (code-quality.md only triggers on *.js, not *.ts). GitHub Copilot instruction added for new dimension. Also added 8 execution guardrails including 3 project-specific ones derived from AGENTS.md (no-auto-eval, spec-first, skill-docs-required).
