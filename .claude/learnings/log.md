@@ -3,6 +3,9 @@
 Append-only learnings log for the `sdlc-marketplace` repository.
 Entries flow from incidents, debugging sessions, and evolution cycles.
 
+## 2026-05-05 — version-sdlc: flags.changelog vs config.changelog in auto mode
+When `--auto` is combined with `config.changelog: true` but the script (pre-fix) emits `flags.changelog: false`, the skill must still honor the task-level intent (`config.changelog`). The script bug (#219) was the root cause; the fix is in `skill/version.js`. Post-fix, `flags.changelog` will correctly reflect `config.changelog` even in auto mode.
+
 ## 2026-05-05 — pr-sdlc: PR #222 created for fix/217-openspec-enrich-yaml-block
 PR used the project custom template (.claude/pr-template.md). Custom template sections matched 1:1 with the 8 default sections by intent. Label `bug` inferred from `fix/` branch prefix and `fix(...)` commit subjects via LLM mode. Title pattern `^(feat|fix|...)\(#\d+\): .+ - .+$` required the issue number in parentheses — critical to get right for this repo.
 
@@ -91,3 +94,6 @@ Resumed execution on `fix/#208-#209-#214-pipeline-bugs` where the prior wave 0 h
 
 ## 2026-05-05 — execute-plan-sdlc: Agent dispatch tool unavailable in environment
 When the Agent/Task dispatch tool is not registered in the runtime tool list, the orchestrator must fall back to direct main-context execution rather than failing. The skill protocol allows this implicitly (small-plan path), but the heuristic should be: if dispatch is unavailable, treat all tasks as inline regardless of complexity and rely on per-task verification + post-execution acceptance-criteria checks. Tasks 1–4 of plan #217 executed sequentially in main context with full verification — outcome equivalent to wave dispatch for a 4-task plan.
+
+## 2026-05-05 — version-sdlc: changelog skip under auto-dispatch (#219)
+Even though prepare script (#213) correctly resolved flags.changelog, residual SKILL.md sites that read config.changelog directly or used vague "if changelog is enabled" wording let the LLM skip the changelog write under sub-agent dispatch. Fix: every gate (draft, write, release-plan display) now cites `flags.changelog === true` verbatim. Step 7.5 CI-scaffold remains config.changelog-gated by design (persistent project setup, not per-release). Lesson: when a script-emitted resolved value is the contract, every consumer site must cite that exact field name; vague phrasing leaks back to original-source semantics.
