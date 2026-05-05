@@ -3,6 +3,15 @@
 Append-only learnings log for the `sdlc-marketplace` repository.
 Entries flow from incidents, debugging sessions, and evolution cycles.
 
+## 2026-05-06 — pr-sdlc: PR #236 created for feat/harden-sdlc-skill → main
+Custom template active (.claude/pr-template.md). Title pattern required type(#issue): scope - description format. Installed pr.js was 0.17.47 (project at 0.18.0) — --validate-body still worked. Branch was already up to date on remote despite remoteState.pushed=false. Labels enhancement+documentation inferred via llm mode from feat/ prefix and docs/* changes.
+
+## 2026-05-06 — version-sdlc: v0.18.0 minor release from feat/harden-sdlc-skill
+First push from a fresh feature branch — `remoteState.hasUpstream === false` triggered `--set-upstream` auto-heal correctly. Release contained new harden-sdlc skill (feat) and two fix commits. All CI scripts were current (no scaffold updates needed).
+
+## 2026-05-06 — received-review-sdlc: harden-sdlc review round — 9 findings fixed, 2 pushed back
+Fixed HIGH: silent catches in harden-prepare.js now log to stderr (H1, H2), EXIT_CODE_ARG rename avoids bash variable collision (H3), dual critique gate added to harden-orchestrator (H4), Step 4 skip-label corrected (H5), review-sdlc spec R16 step reference corrected to Step 5 (H6), commit-sdlc spec R13 narrowed to subjectPattern only (H7). Fixed MEDIUM: stdin JSON parse error now logged (M1), pipeline array in skills-meta.ts gains "learn" step (M2), trap guarded with [ -n ] (M3). Pushed back: M4 (P11 vs R4 — different concerns, no defect), L1 (no requirement for dimensions to cover log.md).
+
 ## 2026-05-05 — version-sdlc: patch release v0.17.47 from fix/220-223-context-stats-ship-state-cleanup
 Single fix commit (context-stats token calculation + ship-state GC cleanup). Branch had no upstream — first push used --set-upstream automatically. Changelog disabled (flags.changelog === false despite config.changelog === true; --auto mode without explicit --changelog flag). All CI scripts current at their installed versions.
 
@@ -106,3 +115,6 @@ Plan 220-223-steady-clarke.md (#220 context-stats fix + #223 ship-state lifecycl
 - **Reserved synthetic steps:** the cleanup step is appended unconditionally by `skill/ship.js::computeSteps`, NOT user-configurable. The validator must reject it from `--steps`/`ship.steps[]` regardless of `flagSources.steps` source. Source check (`cli`-only error, `config`-warning) is wrong for reserved names — always an error.
 - **Atomic file rename + content edit pattern:** `migrateBranchSlug` writes the new path first (atomic temp+rename) then unlinks the old. There is a brief window where both files exist; `findStateFile` sorts by mtime descending and picks the newest. Acceptable for state files (single-writer), don't generalize this pattern to multi-writer scenarios.
 - **Hook context advisory bug surfaced its own irony:** the context-stats hook reported 100% transcript usage at the start of this very session (using the broken bytes/4 heuristic), which the advisor correctly flagged as stale data — the issue we were fixing. Test fixture `project-context-advisory-real-transcript` with `usage.input_tokens=50000 + cache_read=10000 = 60000 → 30%` validates the fix produces the right answer (and the heavy/light/missing tests in `context-advisory-exec.yaml` still cover the consumer-side advisory text).
+
+## 2026-05-06 — execute-plan-sdlc: harden-sdlc skill scaffolded across 4 waves
+8 tasks executed sequentially (Agent dispatch unavailable in this environment — adapted to inline execution). Three-layer artifacts (spec/SKILL/reference doc) plus prepare script + orchestrator + caller integrations + promptfoo dataset all landed without retries. The 200-line cap on `harden-prepare.js` initially missed by 8 lines; trimming the docstring resolved it, suggesting the C2 cap should be checked before the final docstring is written, not after. Pre-existing `flag-coherence-cross-skill` validator failure (description >512 chars) confirmed unrelated to this work via git stash.
