@@ -174,7 +174,7 @@ Options: **apply** | **skip** | **cancel**
 When the user selects **apply**, validate the proposed change BEFORE writing:
 
 - For `surface == "plan-guardrails"` or `"execute-guardrails"`: the target is
-  `.claude/sdlc.json`. Construct the prospective merged JSON in memory, then
+  `.sdlc/config.json`. Construct the prospective merged JSON in memory, then
   validate via the canonical guardrails validator:
 
   ```bash

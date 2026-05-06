@@ -4,12 +4,32 @@ const fs     = require('fs');
 const path   = require('path');
 const crypto = require('crypto');
 
+const { CURRENT_SCHEMA_VERSION } = require('./config-version.js');
+const {
+  PRESET_TO_STEPS: _MIGRATIONS_PRESET_MAP,
+} = require('./config-migrations.js');
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const PROJECT_CONFIG_PATH = path.join('.claude', 'sdlc.json');
+// Issue #231: project config now lives at .sdlc/config.json. The legacy
+// path is read transparently as a one-time fallback (with stderr deprecation
+// notice) for two minor versions; writes always target the new path.
+const PROJECT_CONFIG_PATH = path.join('.sdlc', 'config.json');
+const LEGACY_PROJECT_CONFIG_PATH = path.join('.claude', 'sdlc.json');
 const LOCAL_CONFIG_PATH = path.join('.sdlc', 'local.json');
+
+// Per-process flag: emit the legacy-path deprecation warning at most once.
+let _legacyProjectWarningEmitted = false;
+function emitLegacyProjectWarningOnce() {
+  if (_legacyProjectWarningEmitted) return;
+  _legacyProjectWarningEmitted = true;
+  process.stderr.write(
+    `Deprecation: ${LEGACY_PROJECT_CONFIG_PATH} is the legacy project-config path. ` +
+    `Run /setup-sdlc --migrate to relocate to ${PROJECT_CONFIG_PATH}.\n`
+  );
+}
 
 const PROJECT_SCHEMA_URL =
   'https://raw.githubusercontent.com/rnagrodzki/sdlc-marketplace/main/schemas/sdlc-config.schema.json';
@@ -19,24 +39,14 @@ const LOCAL_SCHEMA_URL =
 const PRESET_NAMES = ['full', 'balanced', 'minimal'];
 const LEGACY_PRESET_MAP = { A: 'full', B: 'balanced', C: 'minimal' };
 
-// Current schema version of .sdlc/local.json. Incremented when a
-// format-breaking change is introduced; readLocalConfig auto-migrates
-// older versions in place.
-const LOCAL_SCHEMA_VERSION = 2;
+// Issue #232: schemaVersion is the unified version field. The legacy
+// LOCAL_SCHEMA_VERSION constant is preserved as an alias of
+// CURRENT_SCHEMA_VERSION for callers that still import it.
+const LOCAL_SCHEMA_VERSION = CURRENT_SCHEMA_VERSION;
 
-// Migration map (v1 → v2): legacy ship.preset values → canonical steps[].
-// `balanced` omits 'version' by design (current pre-v2 default behavior).
-// Legacy A/B/C aliases map to the same step lists as their modern equivalents.
-const PRESET_TO_STEPS = {
-  full:     ['execute', 'commit', 'review', 'version', 'pr', 'archive-openspec', 'learnings-commit'],
-  balanced: ['execute', 'commit', 'review',            'pr', 'archive-openspec', 'learnings-commit'],
-  minimal:  ['execute', 'commit',                      'pr',                     'learnings-commit'],
-  A:        ['execute', 'commit', 'review', 'version', 'pr', 'archive-openspec', 'learnings-commit'],
-  B:        ['execute', 'commit', 'review',            'pr', 'archive-openspec', 'learnings-commit'],
-  C:        ['execute', 'commit',                      'pr',                     'learnings-commit'],
-};
-
-const ALL_STEPS = ['execute', 'commit', 'review', 'version', 'pr', 'archive-openspec', 'learnings-commit'];
+// PRESET_TO_STEPS is now owned by lib/config-migrations.js. Re-export
+// from there to keep external callers (lib/ship-fields.js) working.
+const PRESET_TO_STEPS = _MIGRATIONS_PRESET_MAP;
 
 /**
  * Normalize a preset value: maps legacy A/B/C to full/balanced/minimal.
@@ -47,53 +57,6 @@ const ALL_STEPS = ['execute', 'commit', 'review', 'version', 'pr', 'archive-open
 function normalizePreset(value) {
   if (typeof value !== 'string') return value;
   return LEGACY_PRESET_MAP[value.toUpperCase()] || value;
-}
-
-/**
- * Migrate a v1 ship section to v2 in place: expand legacy preset → steps[],
- * subtract legacy skip[] members, drop preset/skip keys.
- *
- * @param {object|null|undefined} rawShip — the ship section as read from disk
- * @returns {{ ship: object, changed: boolean }} — the migrated ship section
- *   and a flag indicating whether the section actually changed (used by the
- *   loader to decide whether to rewrite the file and emit the deprecation
- *   notice).
- */
-function migrateShipSectionV1ToV2(rawShip) {
-  if (!rawShip || typeof rawShip !== 'object') {
-    // No ship section at all → nothing to migrate. Return as-is so callers
-    // don't accidentally synthesize a section.
-    return { ship: rawShip, changed: false };
-  }
-
-  const hasLegacyPreset = Object.prototype.hasOwnProperty.call(rawShip, 'preset');
-  const hasLegacySkip   = Object.prototype.hasOwnProperty.call(rawShip, 'skip');
-
-  if (!hasLegacyPreset && !hasLegacySkip) {
-    // Already clean (v2 shape or just lacking the legacy keys) — caller
-    // will leave it alone.
-    return { ship: rawShip, changed: false };
-  }
-
-  const presetRaw = hasLegacyPreset ? rawShip.preset : undefined;
-  const presetKey = typeof presetRaw === 'string' ? presetRaw : undefined;
-
-  // Resolve to the canonical step list. If preset is missing or unrecognized,
-  // default to all six steps (safe default — matches new-config behavior).
-  let steps = PRESET_TO_STEPS[presetKey] ? PRESET_TO_STEPS[presetKey].slice() : ALL_STEPS.slice();
-
-  // Subtract any legacy skip[] members (validating membership; unknown values
-  // are dropped silently — the schema would have rejected them anyway).
-  if (Array.isArray(rawShip.skip)) {
-    const skipSet = new Set(rawShip.skip);
-    steps = steps.filter(s => !skipSet.has(s));
-  }
-
-  // Build the migrated ship section. Preserve all non-legacy fields verbatim.
-  const { preset: _droppedPreset, skip: _droppedSkip, ...rest } = rawShip;
-  const migrated = { ...rest, steps };
-
-  return { ship: migrated, changed: true };
 }
 
 /** Legacy file paths relative to projectRoot. */
@@ -162,21 +125,24 @@ function stripMeta(obj, ...keys) {
 // ---------------------------------------------------------------------------
 
 /**
- * Read the unified project config (.claude/sdlc.json).
- * Falls back to merging legacy files when the unified file is absent.
+ * Read the unified project config.
+ * Reads `.sdlc/config.json` first (issue #231 — new canonical location).
+ * Falls back to legacy `.claude/sdlc.json` with a one-time stderr deprecation
+ * notice. As a last resort, merges individual legacy per-file configs
+ * (`.claude/version.json`, etc).
  *
  * @param {string} projectRoot
  * @returns {{ config: object|null, sources: string[] }}
  */
 function readProjectConfig(projectRoot) {
-  const unifiedPath = path.join(projectRoot, PROJECT_CONFIG_PATH);
-  const unified = readJsonFile(unifiedPath);
-
-  if (unified) {
-    return { config: unified, sources: [PROJECT_CONFIG_PATH] };
+  // 1. New canonical path
+  const newPath = path.join(projectRoot, PROJECT_CONFIG_PATH);
+  const unifiedNew = readJsonFile(newPath);
+  if (unifiedNew) {
+    return { config: unifiedNew, sources: [PROJECT_CONFIG_PATH] };
   }
 
-  // Legacy fallback — merge individual config files
+  // 2. Legacy fallback — merge individual config files
   const sources = [];
   const config = {};
 
@@ -185,7 +151,7 @@ function readProjectConfig(projectRoot) {
   const versionData = readJsonFile(versionPath);
   if (versionData) {
     process.stderr.write(
-      `Deprecation: ${LEGACY.version} detected. Run /setup-sdlc --migrate to consolidate into .claude/sdlc.json.\n`
+      `Deprecation: ${LEGACY.version} detected. Run /setup-sdlc --migrate to consolidate into ${PROJECT_CONFIG_PATH}.\n`
     );
     config.version = stripMeta(versionData, '$schema');
     sources.push(LEGACY.version);
@@ -196,7 +162,7 @@ function readProjectConfig(projectRoot) {
   const jiraData = readJsonFile(jiraPath);
   if (jiraData) {
     process.stderr.write(
-      `Deprecation: ${LEGACY.jira} detected. Run /setup-sdlc --migrate to consolidate into .claude/sdlc.json.\n`
+      `Deprecation: ${LEGACY.jira} detected. Run /setup-sdlc --migrate to consolidate into ${PROJECT_CONFIG_PATH}.\n`
     );
     config.jira = stripMeta(jiraData, '$schema');
     sources.push(LEGACY.jira);
@@ -219,31 +185,13 @@ function readProjectConfig(projectRoot) {
  */
 function readLocalConfig(projectRoot) {
   const localPath = path.join(projectRoot, LOCAL_CONFIG_PATH);
-  let localData = readJsonFile(localPath);
+  const localData = readJsonFile(localPath);
 
-  // v1 → v2 ship migration: when local.json exists, has a ship section with
-  // legacy preset/skip keys, and lacks (or has stale) `version`, migrate in
-  // place, persist, and emit a single deprecation notice. Idempotent — a v2
-  // file with no legacy keys returns false from migrateShipSectionV1ToV2.
-  if (localData && (localData.version == null || localData.version < LOCAL_SCHEMA_VERSION)) {
-    const { ship: migratedShip, changed } = migrateShipSectionV1ToV2(localData.ship);
-    if (changed) {
-      const migratedFull = { ...localData, ship: migratedShip, version: LOCAL_SCHEMA_VERSION, $schema: LOCAL_SCHEMA_URL };
-      writeJsonFile(localPath, migratedFull);
-      process.stderr.write(
-        `Deprecation: ${LOCAL_CONFIG_PATH} migrated from preset/skip to steps[] (schema v${LOCAL_SCHEMA_VERSION}). Run /setup-sdlc --migrate to silence this notice in future.\n`
-      );
-      // Re-read so subsequent code paths see the canonical on-disk shape.
-      localData = readJsonFile(localPath);
-    } else if (localData.version == null && localData.ship && Object.keys(localData.ship).length > 0) {
-      // Edge case: ship section exists but has neither legacy keys nor
-      // version stamp (e.g. only bump/draft were set). Stamp version: 2 so
-      // future reads short-circuit and the file remains schema-valid.
-      const stamped = { ...localData, version: LOCAL_SCHEMA_VERSION, $schema: LOCAL_SCHEMA_URL };
-      writeJsonFile(localPath, stamped);
-      localData = readJsonFile(localPath);
-    }
-  }
+  // Issue #232: schema-version migration is no longer performed here. It is
+  // owned by lib/config-version.js::verifyAndMigrate, called from each
+  // skill's prepare script (and from ship-sdlc at pipeline entry). By the
+  // time this function is invoked, the file is at CURRENT_SCHEMA_VERSION
+  // (or the prepare script halted before now). Reading is pure I/O.
 
   // If local.json exists and has both review and ship, no fallbacks needed
   if (localData && localData.review && localData.ship) {
@@ -288,14 +236,14 @@ function readLocalConfig(projectRoot) {
       config.ship = stripMeta(shipData, '$schema', 'version');
       sources.push(LEGACY.ship);
     } else {
-      // Fallback to .claude/sdlc.json ship key
-      const projectConfigPath = path.join(projectRoot, PROJECT_CONFIG_PATH);
-      const projectData = readJsonFile(projectConfigPath);
-      if (projectData?.ship) {
+      // Fallback to project-config ship key (read new path first, legacy second).
+      const projectConfigNew = path.join(projectRoot, PROJECT_CONFIG_PATH);
+      const projectDataNew = readJsonFile(projectConfigNew);
+      if (projectDataNew?.ship) {
         process.stderr.write(
           `Deprecation: ship section found in ${PROJECT_CONFIG_PATH}. Run /setup-sdlc --migrate to move it to .sdlc/local.json.\n`
         );
-        config.ship = projectData.ship;
+        config.ship = projectDataNew.ship;
         sources.push(PROJECT_CONFIG_PATH);
       }
     }
@@ -340,8 +288,10 @@ function readSection(projectRoot, section) {
 // ---------------------------------------------------------------------------
 
 /**
- * Write the unified project config (.claude/sdlc.json).
+ * Write the unified project config (.sdlc/config.json).
  * Uses read-merge-write to avoid clobbering sections written by other skills.
+ * Always stamps `schemaVersion: CURRENT_SCHEMA_VERSION` (issue #232) so
+ * subsequent reads short-circuit verifyAndMigrate.
  *
  * @param {string} projectRoot
  * @param {object} config — partial or full config to merge
@@ -349,7 +299,12 @@ function readSection(projectRoot, section) {
 function writeProjectConfig(projectRoot, config) {
   const filePath = path.join(projectRoot, PROJECT_CONFIG_PATH);
   let existing = readJsonFile(filePath) || {};
-  const merged = { ...existing, ...config, $schema: PROJECT_SCHEMA_URL };
+  const merged = {
+    ...existing,
+    ...config,
+    schemaVersion: config.schemaVersion != null ? config.schemaVersion : CURRENT_SCHEMA_VERSION,
+    $schema: PROJECT_SCHEMA_URL,
+  };
   writeJsonFile(filePath, merged);
 }
 
@@ -367,13 +322,16 @@ function writeProjectConfig(projectRoot, config) {
 function writeLocalConfig(projectRoot, config) {
   const filePath = path.join(projectRoot, LOCAL_CONFIG_PATH);
   let existing = readJsonFile(filePath) || {};
-  // Always stamp version: 2 at the top level. Caller-supplied overrides
-  // are honored (so an explicit version: N still wins) but the default is
-  // the current schema version. $schema URL is fixed.
+  // Issue #232: stamp schemaVersion at the top level. Caller-supplied
+  // overrides are honored (so an explicit schemaVersion: N still wins) but
+  // the default is CURRENT_SCHEMA_VERSION. The legacy `version` field is
+  // dropped from any pre-existing data — it is renamed to `schemaVersion`
+  // by the v2→v3 migration step. $schema URL is fixed.
+  const { version: _droppedLegacyVersion, ...existingClean } = existing;
   const merged = {
-    ...existing,
+    ...existingClean,
     ...config,
-    version: config.version != null ? config.version : LOCAL_SCHEMA_VERSION,
+    schemaVersion: config.schemaVersion != null ? config.schemaVersion : CURRENT_SCHEMA_VERSION,
     $schema: LOCAL_SCHEMA_URL,
   };
   writeJsonFile(filePath, merged);
@@ -401,24 +359,42 @@ function writeSection(projectRoot, section, value) {
 }
 
 // ---------------------------------------------------------------------------
-// migrateConfig
+// consolidateLegacyFiles (renamed from migrateConfig — issue #231/#232)
 // ---------------------------------------------------------------------------
 
 /**
- * Read all legacy config files, merge into unified configs, and write them.
- * Does NOT delete legacy files — the caller decides.
+ * Read all legacy *file-layout* configs (per-section files like
+ * `.claude/version.json`, `.sdlc/ship-config.json`), merge their content
+ * into the unified `.sdlc/config.json` and `.sdlc/local.json`, and write
+ * them. Does NOT delete legacy files — the caller decides.
+ *
+ * **Renamed from `migrateConfig`** (issue #231) to disambiguate from the
+ * schema-version migration owned by `lib/config-version.js::verifyAndMigrate`:
+ *   - `consolidateLegacyFiles` runs once during setup; it reshapes file
+ *     layout (multi-file → unified).
+ *   - `verifyAndMigrate` runs every skill invocation; it walks the schema
+ *     migration registry (v0→v3 etc.) on the unified files.
+ *
+ * Schema-version migration (e.g. v1→v2 ship preset/skip → steps[]) is no
+ * longer performed inline here — it is deferred to `verifyAndMigrate`,
+ * which the caller invokes after this function completes.
  *
  * @param {string} projectRoot
  * @returns {{ migrated: string[], conflicts: string[] }}
  */
-function migrateConfig(projectRoot) {
+function consolidateLegacyFiles(projectRoot) {
   const migrated = [];
   const conflicts = [];
 
   // --- Project config ---
   const projectConfig = {};
   const unifiedPath = path.join(projectRoot, PROJECT_CONFIG_PATH);
-  const existingUnified = readJsonFile(unifiedPath);
+  // For ship-section consolidation we also need to look at the legacy
+  // unified path (.claude/sdlc.json) when the new path is empty — this
+  // function may run before verifyAndMigrate has relocated it.
+  // Runs before migration — legacy file may still exist here
+  const existingUnified = readJsonFile(unifiedPath)
+    || readJsonFile(path.join(projectRoot, LEGACY_PROJECT_CONFIG_PATH));
 
   // version
   const versionPath = path.join(projectRoot, LEGACY.version);
@@ -483,39 +459,27 @@ function migrateConfig(projectRoot) {
   }
 
   // ship — legacy .sdlc/ship-config.json → .sdlc/local.json
+  // Schema-version migration (v1→v2 preset/skip → steps[]) is deferred to
+  // verifyAndMigrate which the caller (migrate-config.js) invokes after.
   let shipMigrated = false;
   const shipPath = path.join(projectRoot, LEGACY.ship);
   const shipData = readJsonFile(shipPath);
   if (shipData) {
     const section = stripMeta(shipData, '$schema', 'version');
-    // Run v1→v2 ship-shape migration on the legacy file content too — a
-    // legacy ship-config.json may carry preset/skip in its ship section.
-    const { ship: migratedShipFromLegacy } = migrateShipSectionV1ToV2(section);
     if (existingLocal?.ship) {
       conflicts.push(LEGACY.ship);
     } else {
-      writeLocalConfig(projectRoot, { ship: migratedShipFromLegacy });
+      writeLocalConfig(projectRoot, { ship: section });
       migrated.push(LEGACY.ship);
       shipMigrated = true;
     }
   }
 
-  // v1 → v2 ship-shape migration: if the local file has version < 2 and
-  // a ship section with legacy preset/skip keys, migrate it explicitly.
-  // (readLocalConfig already does this on demand; running it here makes
-  // /setup-sdlc --migrate cover the case explicitly with a migrated entry.)
-  const localPathForV2 = path.join(projectRoot, LOCAL_CONFIG_PATH);
-  const reloaded = readJsonFile(localPathForV2);
-  if (reloaded && (reloaded.version == null || reloaded.version < LOCAL_SCHEMA_VERSION)) {
-    const { ship: migratedShipReloaded, changed } = migrateShipSectionV1ToV2(reloaded.ship);
-    if (changed) {
-      const next = { ...reloaded, ship: migratedShipReloaded, version: LOCAL_SCHEMA_VERSION, $schema: LOCAL_SCHEMA_URL };
-      writeJsonFile(localPathForV2, next);
-      migrated.push(`${LOCAL_CONFIG_PATH}#v1->v2`);
-    }
-  }
-
-  // ship — .claude/sdlc.json ship key → .sdlc/local.json
+  // ship — legacy project-config ship key → .sdlc/local.json.
+  // existingUnified may have been read from the new path or the legacy
+  // path; we only strip ship from the new-path file (the legacy file is
+  // left untouched — verifyAndMigrate's relocation step copies it as-is
+  // and a subsequent ship-stripping write happens through writeProjectConfig).
   if (existingUnified?.ship) {
     const localHasShip = existingLocal?.ship || shipMigrated;
     if (localHasShip) {
@@ -524,9 +488,16 @@ function migrateConfig(projectRoot) {
       writeLocalConfig(projectRoot, { ship: existingUnified.ship });
       migrated.push(PROJECT_CONFIG_PATH + '#ship');
     }
-    // Remove ship from project config regardless of conflict
-    const { ship: _removed, ...rest } = existingUnified;
-    writeJsonFile(unifiedPath, { ...rest, $schema: PROJECT_SCHEMA_URL });
+    // Strip ship from the new-path project config if it exists. If only
+    // the legacy file has it, leave it alone — relocation will copy the
+    // ship-included content over and a subsequent setup pass can re-strip.
+    if (fs.existsSync(unifiedPath)) {
+      const onDisk = readJsonFile(unifiedPath);
+      if (onDisk?.ship) {
+        const { ship: _removed, ...rest } = onDisk;
+        writeJsonFile(unifiedPath, { ...rest, $schema: PROJECT_SCHEMA_URL });
+      }
+    }
   }
 
   return { migrated, conflicts };
@@ -536,24 +507,176 @@ function migrateConfig(projectRoot) {
 // ensureSdlcGitignore
 // ---------------------------------------------------------------------------
 
+// Deny-all + allowlist. Everything inside `.sdlc/` is ignored except:
+// `.gitignore` (the file itself), `config.json`, and `review-dimensions/`.
+// All other files and directories are ignored by default.
+const SDLC_GITIGNORE_PATTERNS = [
+  '*',
+  '!.gitignore',
+  '!config.json',
+  '!review-dimensions/',
+  '!review-dimensions/**',
+];
+const SDLC_GITIGNORE_BEGIN = '# >>> sdlc-utilities managed (do not edit) — selective ignores';
+const SDLC_GITIGNORE_END   = '# <<< sdlc-utilities managed';
+
 /**
- * Create .sdlc/ directory and .sdlc/.gitignore with content `*\n`.
- * Idempotent: if .gitignore already exists, returns 'existed'.
+ * Create `.sdlc/` directory and `.sdlc/.gitignore` with selective ignore
+ * patterns (issue #231). Idempotent — re-running rewrites the managed block
+ * in place rather than duplicating it.
  *
  * @param {string} projectRoot
- * @returns {'created'|'existed'}
+ * @returns {'created'|'updated'|'unchanged'}
  */
 function ensureSdlcGitignore(projectRoot) {
   const sdlcDir = path.join(projectRoot, '.sdlc');
   fs.mkdirSync(sdlcDir, { recursive: true });
 
   const gitignorePath = path.join(sdlcDir, '.gitignore');
+
+  const managedBlock = [
+    SDLC_GITIGNORE_BEGIN,
+    ...SDLC_GITIGNORE_PATTERNS,
+    SDLC_GITIGNORE_END,
+  ].join('\n');
+
+  // Step 1: Read existing file (empty string if absent).
+  let existing = '';
+  let fileExisted = false;
   if (fs.existsSync(gitignorePath)) {
-    return 'existed';
+    existing = fs.readFileSync(gitignorePath, 'utf8');
+    fileExisted = true;
   }
 
-  fs.writeFileSync(gitignorePath, '*\n', 'utf8');
-  return 'created';
+  // Step 2: Split into lines. Locate any existing managed block via markers;
+  // extract it and remove it from the line list (leaving "other" lines).
+  const lines = existing === '' ? [] : existing.split('\n');
+  // Remove trailing empty string caused by a final newline.
+  if (lines.length > 0 && lines[lines.length - 1] === '') {
+    lines.pop();
+  }
+
+  const managedPatternSet = new Set(SDLC_GITIGNORE_PATTERNS);
+  const otherLines = [];
+  let insideBlock = false;
+  for (const line of lines) {
+    if (line === SDLC_GITIGNORE_BEGIN) {
+      insideBlock = true;
+      continue;
+    }
+    if (line === SDLC_GITIGNORE_END) {
+      insideBlock = false;
+      continue;
+    }
+    if (insideBlock) {
+      // Drop lines that are part of the managed block.
+      continue;
+    }
+    // Step 3: Drop any "other" lines whose trimmed value exactly matches a
+    // member of SDLC-managed patterns (legacy raw pattern lines).
+    if (managedPatternSet.has(line.trim())) {
+      continue;
+    }
+    otherLines.push(line);
+  }
+
+  // Step 4: Reconstruct: leading user lines (if any) + blank separator +
+  // managed block + trailing newline.
+  let next;
+  if (otherLines.length > 0) {
+    next = otherLines.join('\n') + '\n\n' + managedBlock + '\n';
+  } else {
+    next = managedBlock + '\n';
+  }
+
+  // Step 5: Compare result to original; return status.
+  if (next === existing) return 'unchanged';
+  fs.writeFileSync(gitignorePath, next, 'utf8');
+  return fileExisted ? 'updated' : 'created';
+}
+
+// ---------------------------------------------------------------------------
+// ensureReviewDimensionsRelocated
+// ---------------------------------------------------------------------------
+
+/**
+ * Idempotent one-time copy: if `.claude/review-dimensions/` exists AND
+ * `.sdlc/review-dimensions/` is absent/empty, copy all files from the legacy
+ * location to the new one. The legacy directory is NOT deleted here (cleanup is
+ * handled by cleanupLegacyClaudeFiles (R-layout-9)). Skip-if-exists semantics:
+ * individual files already in `.sdlc/review-dimensions/` are not overwritten.
+ *
+ * @param {string} projectRoot
+ * @returns {'created'|'noop'}
+ */
+function ensureReviewDimensionsRelocated(projectRoot) {
+  const legacyDir = path.join(projectRoot, '.claude', 'review-dimensions');
+  const newDir    = path.join(projectRoot, '.sdlc',   'review-dimensions');
+
+  if (!fs.existsSync(legacyDir)) return 'noop';
+
+  fs.mkdirSync(newDir, { recursive: true });
+
+  // Copy files from legacy → new with skip-if-exists semantics.
+  let copied = 0;
+  let entries = [];
+  try {
+    entries = fs.readdirSync(legacyDir, { withFileTypes: true });
+  } catch (_) {
+    return 'noop';
+  }
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const src  = path.join(legacyDir, entry.name);
+    const dest = path.join(newDir,    entry.name);
+    if (!fs.existsSync(dest)) {
+      fs.copyFileSync(src, dest);
+      copied++;
+    }
+  }
+  return copied > 0 ? 'created' : 'noop';
+}
+
+// ---------------------------------------------------------------------------
+// cleanupLegacyClaudeFiles (R-layout-9)
+// ---------------------------------------------------------------------------
+
+/**
+ * Remove legacy `.claude/` SDLC files that have already been relocated to
+ * `.sdlc/`. Each deletion is gated on the new target being present and
+ * non-empty, so the cleanup is safe to run after relocation steps.
+ *
+ * Removes:
+ *   - `.claude/sdlc.json`         — gated on `.sdlc/config.json` existing and non-empty
+ *   - `.claude/sdlc.json.bak`     — same gate
+ *   - `.claude/review-dimensions/`— gated on `.sdlc/review-dimensions/` being non-empty
+ *
+ * Implements R-layout-9.
+ *
+ * @param {string} projectRoot
+ * @returns {{ removed: string[] }}
+ */
+function cleanupLegacyClaudeFiles(projectRoot) {
+  const removed = [];
+  const claudeJson    = path.join(projectRoot, '.claude', 'sdlc.json');
+  const claudeBak     = path.join(projectRoot, '.claude', 'sdlc.json.bak');
+  const claudeRevDir  = path.join(projectRoot, '.claude', 'review-dimensions');
+  const sdlcJson      = path.join(projectRoot, '.sdlc', 'config.json');
+  const sdlcRevDir    = path.join(projectRoot, '.sdlc', 'review-dimensions');
+
+  // Gate: only delete legacy when new target is present and non-empty.
+  const sdlcJsonOk = fs.existsSync(sdlcJson) && fs.statSync(sdlcJson).size > 0;
+  const sdlcRevOk  = fs.existsSync(sdlcRevDir) && fs.readdirSync(sdlcRevDir).length > 0;
+
+  if (sdlcJsonOk) {
+    if (fs.existsSync(claudeJson)) { fs.unlinkSync(claudeJson); removed.push('.claude/sdlc.json'); }
+    if (fs.existsSync(claudeBak))  { fs.unlinkSync(claudeBak);  removed.push('.claude/sdlc.json.bak'); }
+  }
+  if (sdlcRevOk && fs.existsSync(claudeRevDir)) {
+    fs.rmSync(claudeRevDir, { recursive: true, force: true });
+    removed.push('.claude/review-dimensions/');
+  }
+  return { removed };
 }
 
 // ---------------------------------------------------------------------------
@@ -565,19 +688,31 @@ function ensureSdlcGitignore(projectRoot) {
 // the gitignore block is defence-in-depth (issue #209) so a stray cwd-write
 // from any future code path or shell redirect never lands in version control.
 //
+// .sdlc/ runtime files (local.json, cache/, .bak.*, .migration.lock) are now
+// covered by .sdlc/.gitignore (deny-all + allowlist) and no longer need to be
+// listed here.
+//
 // IMPORTANT: keep this list in sync with the prefixes used by `writeOutput`
 // callers across the plugin (commit-context, pr-context, version-context,
 // jira-context, review-manifest, received-review-manifest, sdlc-error-report,
 // plan-prepare, ship-prepare, setup-prepare, etc.). The three glob families
 // below cover all of them.
 const ROOT_GITIGNORE_PATTERNS = [
+  // Transient skill artifacts — defence-in-depth for prepare output files
   '*-context-*.json',
   '*-manifest-*.json',
   '*-prepare-*.json',
 ];
 
-const ROOT_GITIGNORE_BEGIN = '# >>> sdlc-utilities managed (do not edit) — transient skill artifacts';
-const ROOT_GITIGNORE_END   = '# <<< sdlc-utilities managed';
+// Bump the managed-block version marker to v3. The .sdlc/ runtime patterns
+// are now handled by .sdlc/.gitignore (deny-all + allowlist), so the root
+// block only needs the three transient-artifact globs.
+const ROOT_GITIGNORE_BEGIN    = '# >>> sdlc-utilities managed v3 (do not edit) — transient skill artifacts';
+const ROOT_GITIGNORE_END      = '# <<< sdlc-utilities managed';
+// Legacy v2 marker (used for in-place replacement of v2 blocks).
+const ROOT_GITIGNORE_BEGIN_V2 = '# >>> sdlc-utilities managed v2 (do not edit) — transient skill artifacts and .sdlc/ runtime';
+// Legacy v1 marker (used for in-place replacement of older blocks).
+const ROOT_GITIGNORE_BEGIN_V1 = '# >>> sdlc-utilities managed (do not edit) — transient skill artifacts';
 
 /**
  * Append (or update in place) a managed block to the consumer project root
@@ -607,17 +742,30 @@ function ensureRootGitignore(projectRoot) {
     fileExisted = true;
   }
 
-  // Look for an existing managed block. The regex matches the BEGIN marker,
-  // any content, and the matching END marker on a line of its own.
-  const blockRegex = new RegExp(
+  // Look for an existing managed block. Cascade: v3 → v2 → v1 so existing
+  // installations are upgraded in place.
+  const blockRegexV3 = new RegExp(
     `${escapeRegExp(ROOT_GITIGNORE_BEGIN)}[\\s\\S]*?${escapeRegExp(ROOT_GITIGNORE_END)}`,
+    'm'
+  );
+  const blockRegexV2 = new RegExp(
+    `${escapeRegExp(ROOT_GITIGNORE_BEGIN_V2)}[\\s\\S]*?${escapeRegExp(ROOT_GITIGNORE_END)}`,
+    'm'
+  );
+  const blockRegexV1 = new RegExp(
+    `${escapeRegExp(ROOT_GITIGNORE_BEGIN_V1)}[\\s\\S]*?${escapeRegExp(ROOT_GITIGNORE_END)}`,
     'm'
   );
 
   let next;
-  if (blockRegex.test(existing)) {
-    // Replace in place.
-    next = existing.replace(blockRegex, managedBlock);
+  if (blockRegexV3.test(existing)) {
+    next = existing.replace(blockRegexV3, managedBlock);
+  } else if (blockRegexV2.test(existing)) {
+    // Upgrade v2 → v3 in place.
+    next = existing.replace(blockRegexV2, managedBlock);
+  } else if (blockRegexV1.test(existing)) {
+    // Upgrade v1 → v3 in place.
+    next = existing.replace(blockRegexV1, managedBlock);
   } else if (existing.length === 0) {
     next = managedBlock + '\n';
   } else {
@@ -637,6 +785,30 @@ function escapeRegExp(str) {
 }
 
 // ---------------------------------------------------------------------------
+// ensureSdlcInfrastructure
+// ---------------------------------------------------------------------------
+
+/**
+ * Composite helper: runs all idempotent layout reconciliation steps in one
+ * call. Covers `.sdlc/.gitignore` (deny-all template), root `.gitignore`
+ * (transient artifact managed block), and review-dimensions relocation.
+ * Called by prepare scripts and migrate-config regardless of skip flag.
+ *
+ * @param {string} projectRoot
+ * @returns {{ sdlcGitignore: string, rootGitignore: string, reviewDimensions: string }}
+ */
+function ensureSdlcInfrastructure(projectRoot) {
+  const reviewDimensions = ensureReviewDimensionsRelocated(projectRoot);
+  const legacyCleanup    = cleanupLegacyClaudeFiles(projectRoot);
+  return {
+    sdlcGitignore:    ensureSdlcGitignore(projectRoot),
+    rootGitignore:    ensureRootGitignore(projectRoot),
+    reviewDimensions,
+    legacyCleanup,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
 
@@ -647,18 +819,23 @@ module.exports = {
   writeProjectConfig,
   writeLocalConfig,
   writeSection,
-  migrateConfig,
+  consolidateLegacyFiles,
+  // Backward-compat alias — renamed in issue #231; remove in 0.21.x.
+  migrateConfig: consolidateLegacyFiles,
   ensureSdlcGitignore,
+  ensureReviewDimensionsRelocated,
+  cleanupLegacyClaudeFiles,
   ensureRootGitignore,
+  ensureSdlcInfrastructure,
   // Preset normalization
   normalizePreset,
   PRESET_NAMES,
-  // v1 → v2 ship section migration
+  // PRESET_TO_STEPS re-exported from config-migrations.js for callers.
   PRESET_TO_STEPS,
-  migrateShipSectionV1ToV2,
   LOCAL_SCHEMA_VERSION,
   // Exposed for testing
   PROJECT_CONFIG_PATH,
+  LEGACY_PROJECT_CONFIG_PATH,
   LOCAL_CONFIG_PATH,
   LEGACY,
   PROJECT_SCHEMA_URL,

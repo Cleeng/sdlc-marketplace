@@ -42,7 +42,8 @@ function execSafe(cmd) {
 // ---------------------------------------------------------------------------
 
 function detect(projectRoot) {
-  // --- Project config (.claude/sdlc.json) ---
+  // --- Project config (.sdlc/config.json — issue #231; legacy .claude/sdlc.json
+  // read via lib/config.js fallback if PROJECT_CONFIG_PATH points to the new location). ---
   const unifiedPath = path.join(projectRoot, PROJECT_CONFIG_PATH);
   const unifiedExists = fs.existsSync(unifiedPath);
   let projectConfigSections = [];
@@ -88,7 +89,7 @@ function detect(projectRoot) {
   const legacyReviewClaudePath = path.join(projectRoot, LEGACY.reviewClaude);
 
   // --- Content files ---
-  const reviewDimensionsDir = path.join(projectRoot, '.claude', 'review-dimensions');
+  const reviewDimensionsDir = path.join(projectRoot, '.sdlc', 'review-dimensions');
   const prTemplatePath = path.join(projectRoot, '.claude', 'pr-template.md');
   const jiraTemplatesDir = path.join(projectRoot, '.claude', 'jira-templates');
 
@@ -161,7 +162,7 @@ function detect(projectRoot) {
     content: {
       reviewDimensions: {
         count: countFiles(reviewDimensionsDir, '.md'),
-        path: path.join('.claude', 'review-dimensions') + path.sep,
+        path: path.join('.sdlc', 'review-dimensions') + path.sep,
       },
       prTemplate: {
         exists: fs.existsSync(prTemplatePath),
@@ -228,7 +229,7 @@ function detect(projectRoot) {
 
   // Resolve current config slice for a given section, used as `summarize(cfg, detected)`.
   function currentCfgFor(section) {
-    if (section.configFile === '.claude/sdlc.json' && section.configPath) {
+    if (section.configFile === '.sdlc/config.json' && section.configPath) {
       // Walk dot-path. `plan.guardrails`, `execute.guardrails` need split.
       let cfg = parsedProjectConfig;
       if (!cfg) return null;
@@ -270,7 +271,7 @@ function detect(projectRoot) {
     if (misplacedSections.includes(section.id)) return 'legacy';
 
     // Set detection
-    if (section.configFile === '.claude/sdlc.json') {
+    if (section.configFile === '.sdlc/config.json') {
       // Top-level key for simple sections (version, jira, commit, pr); nested
       // for plan-guardrails (plan.guardrails) and execution-guardrails
       // (execute.guardrails).

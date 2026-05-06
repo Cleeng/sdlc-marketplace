@@ -30,7 +30,7 @@ const path = require('node:path');
 const os   = require('node:os');
 const LIB = path.join(__dirname, '..', 'lib');
 
-const { validateAll, extractFrontmatter, extractBody, parseSimpleYaml } = require(path.join(LIB, 'dimensions'));
+const { validateAll, extractFrontmatter, extractBody, parseSimpleYaml, resolveDimensionsDir } = require(path.join(LIB, 'dimensions'));
 const {
   exec,
   checkGitState,
@@ -44,6 +44,7 @@ const {
 } = require(path.join(LIB, 'git'));
 const { readSection, writeLocalConfig } = require(path.join(LIB, 'config'));
 const { writeOutput } = require(path.join(LIB, 'output'));
+const { resolveSkipConfigCheck, ensureConfigVersion } = require(path.join(LIB, 'config-version-prepare'));
 
 // ---------------------------------------------------------------------------
 // Review config (.sdlc/review.json)
@@ -407,7 +408,7 @@ function loadAndMatchDimensions(projectRoot, changedFiles, dimensionFilter) {
   for (const result of report.dimensions) {
     if (result.status === 'FAIL') continue;
 
-    const filePath = path.join(projectRoot, '.claude', 'review-dimensions', result.file);
+    const filePath = path.join(resolveDimensionsDir(projectRoot), result.file);
     let content;
     try { content = fs.readFileSync(filePath, 'utf8'); } catch (_) { continue; }
 
@@ -445,7 +446,20 @@ function loadAndMatchDimensions(projectRoot, changedFiles, dimensionFilter) {
 function main() {
   const { projectRoot, baseBranch, dimensionFilter, scope: cliScope, setDefault } = parseArgs(process.argv);
 
-  // Resolve scope: CLI flag > .claude/review.json > hardcoded default
+  // Issue #232: verifyAndMigrate gate (CLI > env > default false).
+  const skipConfigCheck = resolveSkipConfigCheck(process.argv);
+  const cv = ensureConfigVersion(projectRoot, { skip: skipConfigCheck, roles: ['project', 'local'] });
+  if (cv.errors.length > 0) {
+    writeOutput({
+      errors: cv.errors.map(e => `config-version: ${e.role}: ${e.message}`),
+      warnings: [],
+      flags: { skipConfigCheck },
+      migration: cv.migration,
+    }, 'review-manifest', 1);
+    return;
+  }
+
+  // Resolve scope: CLI flag > review config > hardcoded default
   const reviewConfig = readReviewConfig(projectRoot);
   const scope = cliScope || reviewConfig?.defaults?.scope || 'all';
 
@@ -497,7 +511,7 @@ function main() {
 
   const dims = loadAndMatchDimensions(projectRoot, changedFiles, dimensionFilter);
   if (dims.length === 0) {
-    process.stderr.write('No review dimensions found in .claude/review-dimensions/.\nRun /setup-sdlc --dimensions to create tailored review dimensions.\n');
+    process.stderr.write('No review dimensions found in .sdlc/review-dimensions/.\nRun /setup-sdlc --dimensions to create tailored review dimensions.\n');
     process.exit(1);
   }
 

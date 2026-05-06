@@ -1,6 +1,8 @@
 # setup-sdlc Specification
 
 > Unified setup skill: detect existing configuration, migrate legacy files, interactively configure missing sections, and delegate content creation (review dimensions, PR template, guardrails). Safe to re-run (idempotent).
+>
+> **Layout (issues #231, #232):** Project SDLC config lives at `<project>/.sdlc/config.json` (was `<project>/.claude/sdlc.json`). Local developer config remains at `<project>/.sdlc/local.json`. Review dimensions live at `<project>/.sdlc/review-dimensions/`. Learnings live at `<project>/.sdlc/learnings/log.md`. Both project and local config files carry a top-level `schemaVersion` integer (current value: `3`) verified on every skill load via `lib/config-version.js::verifyAndMigrate`. Legacy `.claude/sdlc.json` is read transparently as a fallback during the deprecation window with a single stderr deprecation warning per process.
 
 **User-invocable:** yes
 **Model:** sonnet
@@ -33,7 +35,7 @@
 - R7: Early exit when everything is configured, no migration needed, and `--force` not passed
 - R8: Ship config is developer-local (`.sdlc/local.json`, gitignored), not project-level
 - R9: Content setup sub-flows: review dimensions (`setup-dimensions.md`), PR template (`setup-pr-template.md`), plan guardrails (`setup-guardrails.md`), execution guardrails (`setup-execution-guardrails.md`), PR labels (`setup-pr-labels.md`)
-- R9a: PR labels sub-flow (`setup-pr-labels.md`, [issue #197](https://github.com/rnagrodzki/sdlc-marketplace/issues/197)) — section id `pr-labels`, configFile `.claude/sdlc.json`, configPath `pr.labels`, `delegatedTo: 'setup-pr-labels'`. Writes a `pr.labels` block matching `schemas/sdlc-config.schema.json#$defs/prLabelsSection`: `mode: "off" | "rules" | "llm"`, optional `rules: { label, when }[]`. The sub-flow runs `gh label list` for the picker, presents an idempotency prompt (`keep`/`replace`/`append`) when the block already exists, and merges into the existing `pr` section without clobbering siblings (`titlePattern`, `allowedTypes`, etc.). The default state for projects that never run this sub-flow is "no `pr.labels` key" — `pr-sdlc` Step 2b interprets that as `mode = "off"`.
+- R9a: PR labels sub-flow (`setup-pr-labels.md`, [issue #197](https://github.com/rnagrodzki/sdlc-marketplace/issues/197)) — section id `pr-labels`, configFile `.sdlc/config.json`, configPath `pr.labels`, `delegatedTo: 'setup-pr-labels'`. Writes a `pr.labels` block matching `schemas/sdlc-config.schema.json#$defs/prLabelsSection`: `mode: "off" | "rules" | "llm"`, optional `rules: { label, when }[]`. The sub-flow runs `gh label list` for the picker, presents an idempotency prompt (`keep`/`replace`/`append`) when the block already exists, and merges into the existing `pr` section without clobbering siblings (`titlePattern`, `allowedTypes`, etc.). The default state for projects that never run this sub-flow is "no `pr.labels` key" — `pr-sdlc` Step 2b interprets that as `mode = "off"`.
 - R10: Project scan phase runs before content sub-flows to collect signals (dependencies, framework, CI, DB, tests, etc.)
 - R11: Version section requires `mode` field (required by schema): `"file"` when version file detected, `"tag"` when not. Optional fields include `versionFile`, `fileType`, `tagPrefix`, `changelog`, `changelogFile`, `ticketPrefix`, and `preRelease`. The `preRelease` field, when set, is a string matching `^[a-z][a-z0-9]*$` that supplies a default pre-release label to version-sdlc when the user runs `version-sdlc` without an explicit base bump or `--pre`. Empty / skipped answers omit the field; the schema (`schemas/sdlc-config.schema.json`) does not require it.
 - R12: Prepare script output is the single authoritative source for all contracted fields (P-fields) — script-provided values take unconditional precedence over skill-generated content, and all factual context (git state, config, flags, metadata) must originate from script output to ensure deterministic behavior
@@ -56,6 +58,17 @@
 - R-menu-5: Empty selection at the menu (when `--only` was not passed) exits cleanly with a "no changes" summary; no config files are written.
 - R-verbose-1: Each section sub-flow in Step 3 prints a verbose header sourced from `prepare.sections[i]` BEFORE any AskUserQuestion: a `Purpose:` line, a `Files modified:` line, a `Consumed by:` line, a `Config file:` line, and a `Current value:` line. For sections with non-empty `fields[]`, the header is followed by an `Options:` block listing every field's name, type, default, and description.
 - R-verbose-2: All option copy (purpose, per-field description, default, options) comes from `scripts/lib/setup-sections.js` (single source of truth). SKILL.md MUST NOT duplicate or paraphrase that copy.
+- R-layout-1 (issue #231): Project config writes target `.sdlc/config.json`. Direct writes to `.sdlc/config.json` are obsolete. `util/setup-init.js` creates the `.sdlc/` directory if missing and writes `.sdlc/config.json`. The pre-existing requirement R6 ("Config writes go through `util/setup-init.js` which calls `lib/config.js` functions") is preserved; only the on-disk path target changes.
+- R-layout-2 (issue #231): Initial project-config write stamps `schemaVersion: 3` (the current `CURRENT_SCHEMA_VERSION` exported from `scripts/lib/config-version.js`). Initial local-config write stamps `schemaVersion: 3` (replacing the legacy top-level `version: 2` integer; the field is renamed as part of the v2→v3 migration step).
+- R-layout-3 (issue #231): During Phase 3 (Migration), setup-sdlc invokes `consolidateLegacyFiles()` (renamed from `migrateConfig()`) for legacy file consolidation, then invokes `scripts/skill/migrate-config.js` (which calls `verifyAndMigrate(projectRoot, 'project')` and `verifyAndMigrate(projectRoot, 'local')`) for schema migration. The two operations are distinct: `consolidateLegacyFiles()` merges historical separate config files (version.json, ship-config.json, review.json) into the unified config; `verifyAndMigrate()` walks the schema-version migration registry. They run in this order during setup; `verifyAndMigrate()` runs on every skill load thereafter.
+- R-layout-4 (issue #231): `.sdlc/.gitignore` content is selective. The managed block lists explicit ignore patterns: `local.json`, `cache/`, `*.bak.*`, `.migration.lock`. Files committed to the repo (under `.sdlc/`): `config.json`, `review-dimensions/`. The historical `*\n` blanket-ignore content is replaced. Implementation: `lib/config.js::ensureSdlcGitignore`.
+- R-layout-5 (issue #231): Root `.gitignore` managed block (existing R23) is extended with the following patterns alongside existing transient artifacts: `.sdlc/local.json`, `.sdlc/cache/`, `.sdlc/*.bak.*`, `.sdlc/.migration.lock`. The block version marker is bumped to `v2` so existing v1 blocks are replaced cleanly. Implementation: `lib/config.js::ensureRootGitignore`.
+- R-layout-6 (issue #231): Backup files for the one-time legacy `.sdlc/config.json` → `.sdlc/config.json` relocation are written to `.sdlc/config.json.bak` (no timestamp suffix — single one-time backup). All other in-place migration backups are written to `.sdlc/<file>.bak.<filesystem-safe-ISO>` where the timestamp uses `T` and `-` separators (no `:`). Setup-sdlc sweeps `.sdlc/*.bak.*` and `.sdlc/config.json.bak.*`, sorts by mtime descending, and unlinks all entries past index 2 (retains the 3 newest backups per role). Stray `.claude/sdlc.json.bak` files written by pre-0.19 buggy runs are removed by `cleanupLegacyClaudeFiles` (R-layout-9).
+- R-layout-7 (issue #231): `--migrate` flag (existing A1) dispatches `scripts/skill/migrate-config.js` for standalone migration without the full setup flow. The script returns a JSON manifest of the form `{ project: { schemaVersion, migrated, backupPath, stepsApplied }, local: { ... }, errors: [] }` and is idempotent (re-run after success is a no-op). The script supports `--dry-run` (no filesystem changes, no lock acquisition).
+- R-layout-8: `ensureSdlcGitignore` is content-aware. The managed block is emitted exactly once. Lines outside the managed block matching any SDLC-managed pattern (`*`, `!.gitignore`, `!config.json`, `!review-dimensions/`, `!review-dimensions/**`) are stripped. User-added unrelated entries are preserved verbatim. Idempotent across all prior content forms (legacy `*\n` blanket, raw allowlist, markered block, mixed).
+- R-layout-9: `ensureSdlcInfrastructure` invokes `cleanupLegacyClaudeFiles(projectRoot)` after `ensureReviewDimensionsRelocated`. The helper deletes `.claude/sdlc.json`, `.claude/sdlc.json.bak`, and `.claude/review-dimensions/` only when the corresponding `.sdlc/` target exists and is non-empty. Returns `{ removed: string[] }`. Cleanup is silent when `--dry-run` is active (the gate is already in migrate-config.js which skips `ensureSdlcInfrastructure` entirely under `--dry-run`).
+- R-version-1 (issue #232): The schemaVersion contract is uniform across project and local config: missing field on a project file means `schemaVersion: 0`; missing field on a local file means `schemaVersion: 1` (matches the historical pre-versioned local layout); a numeric `schemaVersion` is read verbatim. A file with `schemaVersion > CURRENT_SCHEMA_VERSION` is refused with `ConfigVersionTooNewError` carrying the plugin version and the maximum supported value.
+- R-deprecation-1: When `migrate-config.js` (or setup-sdlc's migration phase) successfully relocates `.claude/sdlc.json` → `.sdlc/config.json` AND copies `.claude/review-dimensions/` → `.sdlc/review-dimensions/`, the script removes the legacy files: `.claude/sdlc.json`, `.claude/sdlc.json.bak` (any), and `.claude/review-dimensions/` (recursive). Removal is idempotent and silent on `--dry-run`. Read-only fallback to `.claude/sdlc.json` and `.claude/review-dimensions/` is removed in the same release.
 
 ## Workflow Phases
 
@@ -64,15 +77,15 @@
    - **Params:** none
    - **Output:** JSON → P1-P8 plus P-sections (project config state/sections/path, local config state, legacy file detection, content counts, detected version file/tag prefix/default branch, migration flag, openspec block, joined `sections[]`)
 2. SELECTIVE-SECTION MENU — render rows from `prepare.sections[]`; user selects which sections to configure (legacy rows auto-selected and locked); empty selection exits without changes
-3. MIGRATION (conditional) — migrate legacy config files to unified format
-   - **Script:** `lib/config.js` → `migrateConfig()` via inline Node.js
+3. MIGRATION (conditional) — consolidate legacy config files and migrate config schema (issues #231, #232)
+   - **Scripts:** `lib/config.js` → `consolidateLegacyFiles()` (renamed from `migrateConfig()`) for legacy file consolidation; then `scripts/skill/migrate-config.js` for schema migration via `lib/config-version.js::verifyAndMigrate`
    - **Params:** project root, legacy config paths
-   - **Output:** merged config written to `.claude/sdlc.json`
+   - **Output:** merged config written to `.sdlc/config.json` (was `.sdlc/config.json`); `schemaVersion` stamp applied; backup written per R-layout-6
 4. DISPATCH LOOP — for each selected section, print a verbose header (purpose, files-modified, consumed-by, config-file, current-value) sourced from `prepare.sections[i]`, then dispatch the appropriate branch:
    - `delegatedTo: null` → generic field loop (one AskUserQuestion per `section.fields[]` entry, optionally gated by `section.confirmDetected`)
    - `delegatedTo: 'inline-commit-builder' | 'inline-pr-builder'` → conditional inline pattern builders for `commit` / `pr` sections
    - `delegatedTo: 'setup-<sub>'` → invoke the sub-flow document (review-dimensions, pr-template, plan-guardrails, execution-guardrails, openspec-block)
-   - **Output:** config files written to `.claude/sdlc.json` and `.sdlc/local.json` via `lib/config.js::writeProjectConfig`/`writeLocalConfig`; content artifacts written by sub-flows
+   - **Output:** config files written to `.sdlc/config.json` and `.sdlc/local.json` via `lib/config.js::writeProjectConfig`/`writeLocalConfig` (each write stamps `schemaVersion: 3`); content artifacts written by sub-flows
 5. SUMMARY — display what was created, updated, or migrated
    - **Script:** `skill/setup.js` (re-run for G2 validation)
    - **Params:** none
@@ -88,7 +101,7 @@
 
 ## Prepare Script Contract
 
-- P1: `projectConfig` (object) — `{ exists, sections, misplaced, path }` state of `.claude/sdlc.json`
+- P1: `projectConfig` (object) — `{ exists, sections, misplaced, path }` state of `.sdlc/config.json` (read with legacy fallback to `.sdlc/config.json` per R-deprecation-1)
 - P2: `localConfig` (object) — `{ exists, path }` state of `.sdlc/local.json`
 - P3: `legacy` (object) — `{ version, ship, review, reviewLegacy, jira }` each with `{ exists, path }`
 - P4: `content` (object) — `{ reviewDimensions: { count, path }, prTemplate: { exists, path }, jiraTemplates: { count, path } }`
@@ -104,7 +117,7 @@
   - `summary` (string) — one-line summary of the current configuration (empty for `not-set`)
   - `locked` (boolean) — `true` when `needsMigration === true` and `state === 'legacy'`; locked rows are auto-selected in the menu and cannot be unchecked
   - `purpose` (string) — one-paragraph runtime explanation of what this section does
-  - `configFile` (string) — `.claude/sdlc.json` | `.sdlc/local.json` | `<delegated>` | `openspec/config.yaml`
+  - `configFile` (string) — `.sdlc/config.json` | `.sdlc/local.json` | `<delegated>` | `openspec/config.yaml` (legacy `.sdlc/config.json` may appear for legacy-detection rows during the deprecation window)
   - `configPath` (string|null) — dot-path within `configFile`, or `null` for delegated/content sections
   - `consumedBy` (string[]) — skill ids that read this section at runtime
   - `filesModified` (string[]) — workspace artifacts created or touched
@@ -150,7 +163,10 @@
 ## Integration
 
 - I1: `skill/setup.js` — detects current config state and legacy files
-- I2: `lib/config.js` — `writeProjectConfig`, `writeLocalConfig`, `migrateConfig` functions
+- I2: `lib/config.js` — `writeProjectConfig`, `writeLocalConfig`, `consolidateLegacyFiles` (renamed from `migrateConfig`), `ensureRootGitignore`, `ensureSdlcGitignore`, `cleanupLegacyClaudeFiles` functions
+- I2a (issue #232): `lib/config-version.js` — `CURRENT_SCHEMA_VERSION` (current value 3), `verifyAndMigrate(projectRoot, role, opts)` returning `{ schemaVersion, migrated, backupPath, stepsApplied }`. Throws `ConfigVersionTooNewError`, `ConfigMigrationError`, `ConfigMigrationLocked` on failure modes.
+- I2b (issue #232): `lib/config-migrations.js` — `PROJECT_MIGRATIONS` and `LOCAL_MIGRATIONS` ordered arrays of `{ from, to, run, rollback? }` step objects.
+- I2c (issue #231): `scripts/skill/migrate-config.js` — standalone wrapper around `verifyAndMigrate`, invoked by `setup-sdlc --migrate` and by setup-sdlc's migration phase. Accepts `--dry-run`. Returns 0 on success, non-zero on migration failure.
 - I3: `setup-dimensions.md` — sub-flow for review dimension configuration
 - I4: `setup-pr-template.md` — sub-flow for PR template creation
 - I5: `setup-guardrails.md` — sub-flow for plan guardrail configuration
@@ -161,5 +177,5 @@
 - I10: `jira-sdlc` — consumes jira config written by this skill
 - I11: `setup-openspec.md` — sub-flow for openspec config enrichment
 - I12: `util/openspec-enrich.js` — deterministic script for managed-block operations on `openspec/config.yaml`
-- I13: `setup-pr-labels.md` — sub-flow for PR label assignment policy ([issue #197](https://github.com/rnagrodzki/sdlc-marketplace/issues/197)); writes `pr.labels` (mode: off|rules|llm) into `.claude/sdlc.json`
+- I13: `setup-pr-labels.md` — sub-flow for PR label assignment policy ([issue #197](https://github.com/rnagrodzki/sdlc-marketplace/issues/197)); writes `pr.labels` (mode: off|rules|llm) into `.sdlc/config.json`
 - I14: `lib/setup-sections.js` — single source of truth for the `SETUP_SECTIONS` manifest consumed by `skill/setup.js` to emit `prepare.sections[]` (P-sections) and by SKILL.md Step 1 / Step 3 to render menu rows and verbose headers
