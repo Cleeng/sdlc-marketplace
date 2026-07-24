@@ -134,3 +134,27 @@
       value: "Active pipeline: ship-sdlc on feat/execute-and-ship"
     - type: icontains
       value: "Active execution (post-compact): execute-plan-sdlc on feat/execute-and-ship"
+
+# ---------------------------------------------------------------------------
+# Fixes #485 — sdlc plugin root injected into session context so helper-script
+# resolvers can reference the plugin's own install instead of globbing
+# ~/.claude/plugins (which can pick a fixture/clone copy).
+# ---------------------------------------------------------------------------
+
+- description: "session-start: emits 'sdlc plugin root:' pointing at the real plugin install (line is unconditional — independent of matcher source, see session-start.js:467)"
+  vars:
+    script_path: "repo://plugins/sdlc-utilities/hooks/session-start.js"
+    script_cwd: "{{project_root}}"
+    project_root: "file://fixtures-fs/project-commit-config"
+    script_stdin:
+      hook_event_name: "SessionStart"
+      source: "startup"
+  assert:
+    - type: icontains
+      value: "sdlc plugin root: "
+    - type: icontains
+      value: "plugins/sdlc-utilities"
+    - type: not-icontains
+      value: "/tests/"
+    - type: not-icontains
+      value: "/marketplaces/"
