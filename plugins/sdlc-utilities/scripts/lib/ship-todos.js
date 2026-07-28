@@ -130,33 +130,78 @@ function renderTodos(state, opts = {}) {
   const allSteps  = [...flagSteps];
   if (!allSteps.includes('cleanup')) allSteps.push('cleanup');
 
-  const stateSteps = state.steps || {};
+  // R-b4 (#496, docs/specs/ship-sdlc.md): state.steps is an array of
+  // {name, status} objects, not a name-keyed object — build a lookup map
+  // instead of indexing the array by string key (which was always undefined).
+  // R-SHIPTODOS-FAILLOUD: a non-array `steps` field is a state-file shape bug
+  // (e.g. a stale pre-#496 object-keyed shape), not "zero steps" — silently
+  // coercing to [] makes every step misreport as pending. Fail loudly instead.
+  if (state.steps !== undefined && !Array.isArray(state.steps)) {
+    throw new Error(
+      'renderTodos: state.steps must be an array of {name, status} objects ' +
+      `(R-b4, #496) — got ${Array.isArray(state.steps) ? 'array' : typeof state.steps}. ` +
+      'This state file uses a stale pre-#496 shape and needs migration.'
+    );
+  }
+  const stepByName = new Map((state.steps || []).map(s => [s.name, s]));
 
   const todos = [];
+  let skippedCount = 0;
+  let failedCount  = 0;
 
   for (const stepName of allSteps) {
-    const stepState  = stateSteps[stepName] || {};
+    const stepState  = stepByName.get(stepName) || {};
     const stepStatus = stepState.status || 'pending';
 
     const substeps = parseSubsteps(stepName, planTasks);
 
-    // Determine base status for this step's substeps
+    // Determine base status for this step's substeps.
+    // R-b4 (#496): honor the recorded terminal/stranded status instead of
+    // collapsing every non-current step to 'pending'. TodoWrite has no
+    // skipped/failed value, so terminal statuses map into 'completed' but
+    // carry an explicit content label + a distinct marker count below —
+    // never encoded via activeForm, which stays the in_progress display
+    // string. A stranded in_progress step (recorded in_progress but not
+    // the current step) stays 'in_progress' rather than being silently
+    // downgraded to 'pending'.
     let baseStatus;
-    if (markCompleted.includes(stepName) ||
-        stepStatus === 'completed' ||
-        stepStatus === 'skipped') {
+    let labelSuffix = null;
+    let isSkipped = false;
+    let isFailed  = false;
+    if (markCompleted.includes(stepName) || stepStatus === 'completed') {
       baseStatus = 'completed';
+    } else if (stepStatus === 'skipped') {
+      baseStatus  = 'completed';
+      labelSuffix = ' (skipped)';
+      isSkipped   = true;
+    } else if (stepStatus === 'failed' && stepName !== failStep) {
+      // Excludes the step currently transitioning to failed (stepName ===
+      // failStep): completeStepCore persists status:'failed' BEFORE this
+      // render runs, so without this exclusion this branch would preempt the
+      // fail-step per-substep override below (T6/R-TODOWRITE-TRUTHFUL, #432),
+      // collapsing every substep to a uniform "(failed)" instead of
+      // distinguishing in_progress→"(failed)" from pending→"(not attempted)".
+      // A step that failed in a *prior* run (not the one failing right now)
+      // still takes this coarse branch, which is the intended R-b4 behavior.
+      baseStatus  = 'completed';
+      labelSuffix = ' (failed)';
+      isFailed    = true;
     } else if (stepName === currentStep) {
       baseStatus = 'in_progress'; // overridden per-substep below
+    } else if (stepStatus === 'in_progress') {
+      baseStatus = 'in_progress'; // stranded in_progress: honor, don't downgrade
     } else {
       baseStatus = 'pending';
     }
+    if (isSkipped) skippedCount++;
+    if (isFailed || (failStep && stepName === failStep)) failedCount++;
 
     for (let i = 0; i < substeps.length; i++) {
       const sub    = substeps[i];
       const labels = substepLabels(stepName, sub);
-      let status   = baseStatus;
+      let status     = baseStatus;
       let activeForm = labels.activeForm;
+      let content    = labelSuffix ? `${labels.content}${labelSuffix}` : labels.content;
 
       // Per-substep refinement when this is the current step
       if (stepName === currentStep && baseStatus !== 'completed') {
@@ -184,7 +229,7 @@ function renderTodos(state, opts = {}) {
         }
       }
 
-      todos.push({ content: labels.content, activeForm, status });
+      todos.push({ content, activeForm, status });
     }
   }
 
@@ -202,7 +247,12 @@ function renderTodos(state, opts = {}) {
     eventLabel = event;
   }
 
-  const marker = `[task-tray] ${eventLabel}: pending=${pending}, in_progress=${inProgress}, completed=${completed}`;
+  // R-b4 (#496): skipped/failed counts are appended only when non-zero so
+  // the marker stays byte-identical to the pre-fix format for the common
+  // (no skipped/failed steps) case.
+  let marker = `[task-tray] ${eventLabel}: pending=${pending}, in_progress=${inProgress}, completed=${completed}`;
+  if (skippedCount > 0) marker += `, skipped=${skippedCount}`;
+  if (failedCount  > 0) marker += `, failed=${failedCount}`;
 
   return { todos, marker };
 }
