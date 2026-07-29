@@ -2,7 +2,7 @@
 name: execute-plan-sdlc
 description: "Use when the user wants to execute an implementation plan with adaptive intelligence — classifies tasks by complexity and risk, builds optimized dependency waves, critiques wave structure before dispatch, verifies results after each wave, and recovers from failures without stopping. Self-contained: no external sub-skills required. Triggers on: execute plan, run plan, implement plan, autonomous execution, execute this plan. Requires an explicit plan file — a positional path or `--plan <path>` — at invocation (or a resumable state file, see `--resume`); it is never inferred from conversation context, even when a plan was just discussed or accepted in this session (R41)."
 user-invocable: true
-argument-hint: "<plan-file-path> [--quality full|balanced|minimal] [--resume] [--rebase auto|skip|prompt] [--auto] [--branch <name>] [--commit-waves] [--plan <path>]"
+argument-hint: "<plan-file-path> [--quality full|balanced|minimal] [--resume] [--rebase auto|skip|prompt] [--auto] [--branch <name>] [--commit-waves] [--plan <path>] [--wave-timeout <seconds>] [--wave-interval <seconds>]"
 model: sonnet
 ---
 
@@ -110,7 +110,16 @@ Note: this reads `execute.guardrails` (runtime enforcement), not `plan.guardrail
        - Exit non-zero (sha not reachable — branch was force-pushed, reset, or commit dropped): WARN with the explicit state-mismatch message `Wave N state mismatch: committed sha <sha> is not reachable from HEAD. Refusing to auto-recover — resolve manually (e.g., reset to that sha or restart execution).` Do NOT auto-recover; stop. This is an idempotency check, not an auto-recovery mechanism.
      - `committedSha: null` (recorded soft-success "no diff produced a commit"): treat exactly like `status === 'completed'`, no reachability check needed — the wave had nothing to commit, so re-running it would do nothing.
      - `committedSha` absent: pre-existing waves from runs where `--commit-waves` was off — fall through to the normal `status`-based resume pointer logic.
-  8. Skip to Step 5, resuming from the first wave with status `in_progress` or `pending`. Use the context object to construct inter-wave context for the next wave's agent prompts.
+  8. Clear untrusted rows before computing the resume pointer (R-WAVE-RESUME-RESET, #506):
+     ```bash
+     RESET_RESULT=$(node "$STATE_SCRIPT" resume-reset)
+     ```
+     Task rows recorded for a wave that never reached `completed` are untrusted — main context writes them in a batch after the wave-runner returns, so a wave interrupted mid-write leaves a partial set that `verify-completeness` would otherwise count as accounted, producing a false-complete at the exit-65 gate.
+
+     Read `resetWaves` and `clearedTaskIds` from `$RESET_RESULT`. When `resetWaves` is non-empty, surface one line: `Resumed: cleared <clearedTaskIds.length> untrusted task row(s) from wave(s) <resetWaves, comma-separated> before recomputing resume pointer.`
+
+     A wave whose row carries `timedOut: true` with status `partial` has already spent its full deadline. `resume-reset` only clears `in_progress` waves (see `state/execute.js::cmdResumeReset`), so a `partial` wave's row survives untouched. Its terminated tasks are not special-cased: they proceed to Step 6 (RECOVER) exactly as any other wave failure would, via a fresh wave-runner Agent scoped to the unfinished task IDs (R-WAVE-DEADLINE's testable assertion: "the skill proceeds to recovery rather than aborting the pipeline"). There is no cross-wave task-ID carry-forward into the next wave's dispatch set — merging a `partial` wave's unfinished tasks into wave N+1's already-built task set would risk violating that wave's same-file constraint (R3) and wave-size cap (R4), both fixed statically when waves were built in Step 1.
+  9. Skip to Step 5, resuming from the first wave with status `in_progress` or `pending`. Use the context object to construct inter-wave context for the next wave's agent prompts.
 
   > The small-plan direct-execution path (R5, Step 2b) NEVER triggers per-wave commits regardless of `--commit-waves`. Resume of a small-plan run therefore never encounters a `committedSha` field.
 
@@ -119,14 +128,14 @@ Note: this reads `execute.guardrails` (runtime enforcement), not `plan.guardrail
   - Otherwise, use AskUserQuestion:
     > Found execution state from <startedAt> with <N> of <total> waves completed. Resume from Wave <next>?
     Options: **yes** — resume | **restart** — discard state file and start fresh
-    If "yes", follow the resume flow above (steps 2-7). If "restart", delete the state file and proceed normally.
+    If "yes", follow the resume flow above (steps 2-9). If "restart", delete the state file and proceed normally.
 
 ### Post-compact recovery (Fixes #392 / R36)
 
 In addition to the explicit `--resume` flag, Step 0 MUST scan the SessionStart `<system-reminder>` context for the literal string `Active execution (post-compact):` (emitted by `hooks/session-start.js` when the matcher source is `compact` and execute state exists for the current branch):
 
 1. **`Active execution (post-compact):` present AND `Active pipeline: ship-sdlc` ABSENT** in the same system-reminder block:
-   - Set `implicitResume = true`. This is functionally equivalent to `--resume` being passed on the CLI — the rest of Step 0 takes the resume codepath above (resume detection step 1: locate the most recent state file for the current branch, then steps 2–8 including the `committedSha` idempotency check).
+   - Set `implicitResume = true`. This is functionally equivalent to `--resume` being passed on the CLI — the rest of Step 0 takes the resume codepath above (resume detection step 1: locate the most recent state file for the current branch, then steps 2–9 including the `committedSha` idempotency check).
    - When `--auto` is also active: proceed without any user prompt; jump straight to resume execution. The implicit-resume action is silent.
    - When `--auto` is NOT active: emit ONE `AskUserQuestion`:
      > Resuming execution from wave N — continue? (yes / no)
@@ -150,6 +159,13 @@ The hook is layer-agnostic (it surfaces facts); this discriminator is the consum
 | Flag | Description | Default |
 |---|---|---|
 | `--commit-waves` | Commit each completed wave as `wip(execute): wave N — <titles>` after G9 + G11 pass. Skipped for small-plan path (R5). | false |
+
+**Parse `--wave-timeout <seconds>` / `--wave-interval <seconds>` (R-WAVE-DEADLINE, #506):** If passed, store as `WAVE_TIMEOUT` / `WAVE_INTERVAL` (integers). These are **internal flags forwarded by ship-sdlc**, which resolves `ship.executeWaveTimeout` / `ship.executeWaveInterval` from `.sdlc/local.json` and forwards them on the command line (same wiring pattern as `--branch`, R30) — this skill never reads `.sdlc/local.json` itself. Standalone invocations without either flag fall back to `BUILT_IN_DEFAULTS.executeWaveTimeout` (1800) / `BUILT_IN_DEFAULTS.executeWaveInterval` (60) from `scripts/lib/ship-fields.js`. Both values are threaded into every wave manifest as `waveTimeout` / `waveInterval` (Step 5b below) for the wave-runner's deadline enforcement and `Monitor` poll interval.
+
+| Flag | Description | Default |
+|---|---|---|
+| `--wave-timeout <seconds>` | Per-wave wall-clock deadline enforced by the wave-runner (R-WAVE-DEADLINE). | 1800 (`BUILT_IN_DEFAULTS.executeWaveTimeout`) |
+| `--wave-interval <seconds>` | Wave-runner's `Monitor` poll interval while waiting on background per-task workers. | 60 (`BUILT_IN_DEFAULTS.executeWaveInterval`) |
 
 **Parse `--branch`:** If `--branch <name>` was passed as an argument, capture it as `EXECUTE_NEW_BRANCH` immediately. This is an **INTERNAL flag set by ship-sdlc in pipeline mode**. When present, skip the entire Workspace isolation check below — the caller's branch/cwd are trusted as authoritative. Users do not pass this directly. Implements R30 (fixes #378, #379).
 
@@ -312,6 +328,8 @@ This dispatch is NOT a wave-runner Agent — it is a direct batch-haiku dispatch
 
 **For each wave:**
 
+**First-wave bootstrap (runs once, before wave 1's 5a-pre):** `wave-start` (called in 5b below, for every wave including wave 1) requires an existing state file — `state/execute.js` exits 1 with "no state file found" without one. Before entering this per-wave loop for wave 1, run the `init` call and the one-time `context --data` call, both documented in the State persistence section under 5d below (do NOT wait until 5d of wave 1 to run them — by then 5b's wave-start call has already needed the state file to exist).
+
 > **Nested-dispatch disambiguation (R-nested-dispatch-resilient — Fixes #463):** "Main context" here = execute-plan-sdlc's own top-level orchestration context — the one you are running in now. When ship-sdlc dispatches you as a subagent, you ARE that context. Nested Agent dispatch is supported — being dispatched as a subagent does not remove your Agent tool. Never emit "no agent-dispatch tool available" or otherwise self-block; dispatch the wave-runner Agent for this wave normally. The wave-runner in turn dispatches the per-task Agents — execute-main does not dispatch per-task Agents directly (R8 two-level isolation).
 
 **Progress signal — wave start (mandatory, always first).** Before any gate or dispatch, update TodoWrite:
@@ -364,15 +382,15 @@ Options:
 Build the wave-runner Agent's prompt from:
 
 1. Read `./wave-runner-template.md` for the algorithm, contract, and constraints.
-2. Inline the full content of the per-task template from `./classifying-and-waving-tasks.md` (lines 109–187) as the `perTaskTemplate` input.
-3. When the wave contains 2+ Trivial tasks, also inline the batched-trivial template from `./classifying-and-waving-tasks.md` (lines 189–257) as the `batchedTrivialTemplate` input.
+2. Inline the full content of the per-task template from `./classifying-and-waving-tasks.md` — the entire fenced block under the `## Agent Prompt Template` heading, from its opening fence through its closing fence — as the `perTaskTemplate` input. Inline the WHOLE fence: truncating it drops `## Hard Constraints` and `## Before Reporting: Self-Review` from the worker prompt. (R-WAVE-CONTEXT-PRODUCER, #506)
+3. When the wave contains 2+ Trivial tasks, also inline the entire fenced block under the `## Batched Trivial Tasks Prompt Template` heading as the `batchedTrivialTemplate` input, likewise fence-to-fence. (R-WAVE-CONTEXT-PRODUCER, #506)
 4. Provide the complete wave manifest: `waveNumber`, `totalWaves`, `qualityTier`, `escalationBudget: 2`, and the per-task array with `id`, `complexity`, `risk`, `factSheetPath`, `assignedModel`, and `verifyToken` for each task (R-FACT-SHEET-DISPATCH, #432).
 
    **Fact-sheet dispatch (R-FACT-SHEET-DISPATCH, #432):** Before dispatching the wave-runner, write per-task fact sheets via:
    ```bash
-   node "$STATE_SCRIPT" wave-start --wave <N> --tasks-json '<json-array-of-task-objects>' --run-id <run-id>
+   WAVE_START_RESULT=$(node "$STATE_SCRIPT" wave-start --wave <N> --tasks-json '<json-array-of-task-objects>')
    ```
-   This writes `<stateDir>/execution/<runId>/task-<id>.md` for each task. The printed JSON includes `factSheets: [...]` — the absolute paths to use as `factSheetPath` in the manifest. Task name, notes, files, and acceptance criteria live in the fact sheet; do NOT inline them in the manifest.
+   Do NOT pass `--run-id` — this skill never generates one. `wave-start` derives it once from the state file's `startedAt` field (set at `init`, Step 1) and returns the same value on every wave's call, so it is stable across the whole run without the skill tracking anything itself. Read `runId` and `factSheets: [...]` from `$WAVE_START_RESULT`: `runId` is the value to carry into the manifest's `runId` field (below) and into every downstream `--run-id` flag (`wave-progress`, `summarize-prior-wave-context`); `factSheets` are the absolute paths to use as `factSheetPath` in the manifest. This writes `<stateDir>/execution/<runId>/task-<id>.md` for each task. Task name, notes, files, and acceptance criteria live in the fact sheet; do NOT inline them in the manifest.
 
    **Notes source (optional):** The task object's `description` JSON key is sourced from the optional `**Notes:**` plan field. When a plan task carries a `**Notes:**` label, capture its rationale-only text as the `description` value passed to `--tasks-json`; when absent, pass empty (or omit). `renderFactSheet` emits non-empty notes as a `## Notes (rationale)` section and omits the section entirely when notes are absent. **Backward compatibility (version-skew):** When a `**Description:**` block is encountered in a plan task (legacy format written before the Notes rename), treat its content as the `description` value — do not discard it. Plans written after the rename use `**Notes:**` exclusively; the `**Description:**` label is not produced by new plans but must be handled gracefully when present in existing plans.
 
@@ -387,6 +405,12 @@ Build the wave-runner Agent's prompt from:
    - `expectedFiles: string[]` — deterministic union of every `Files: Create:` / `Files: Modify:` / `Files: Test:` path declared across the wave's tasks (computed by main context during wave build per `classifying-and-waving-tasks.md` step 6b). Used by Step 5c-bis to cross-check `git diff --stat` output.
    - `verificationHint?: string` — optional; populated only when every task in the wave shares the same `Verify:` value verbatim.
 
+   **Wave-deadline manifest fields (R-WAVE-DEADLINE, #506):** every wave manifest MUST additionally carry:
+   - `waveTimeout: <integer>` — seconds, sourced from `WAVE_TIMEOUT` (this skill's own parsed `--wave-timeout` flag, above; ship-sdlc forwards it on the command line, having resolved it from its own `ship.executeWaveTimeout` config key — this skill does not read `.sdlc/local.json` itself). Standalone invocation without the flag falls back to the built-in default in `BUILT_IN_DEFAULTS` (`scripts/lib/ship-fields.js`). Consumed by the wave-runner's deadline enforcement (`wave-runner-template.md` §2b).
+   - `waveInterval: <integer>` — seconds, sourced from `WAVE_INTERVAL` the same way (`ship.executeWaveInterval`); same standalone fallback as `waveTimeout`. Used by the wave-runner as its `Monitor` poll interval.
+   - `runId: <string>` — the `runId` value read from `wave-start`'s JSON output above; required for the wave-runner's progress-heartbeat and timeout-verdict commands (fills the `{RUN_ID}` placeholder).
+   - `stateScript: <absolute path>` — the absolute path to `state/execute.js` (the same `$STATE_SCRIPT` used elsewhere in this step); fills the wave-runner's `{STATE_SCRIPT}` placeholder.
+
    Concrete example:
 
    ```json
@@ -395,6 +419,10 @@ Build the wave-runner Agent's prompt from:
      "totalWaves": 4,
      "qualityTier": "balanced",
      "escalationBudget": 2,
+     "waveTimeout": 900,
+     "waveInterval": 30,
+     "runId": "run-id",
+     "stateScript": "/abs/path/scripts/state/execute.js",
      "tasks": [
        { "id": "3", "complexity": "Standard", "risk": "Low", "factSheetPath": "/abs/path/.sdlc/execution/run-id/task-3.md", "assignedModel": "sonnet", "verifyToken": "dispatchMode in ship.js", "description": "optional rationale text from **Notes:** field; omit or pass empty string when absent" }
      ],
@@ -412,9 +440,11 @@ Build the wave-runner Agent's prompt from:
    ```
    Pass the JSON output as `priorWaveSummary` in the wave-runner prompt. Main context MUST NOT accumulate unbounded per-task narrative across waves — use only the summarizer output for each wave dispatch. Fields: `planSummary`, `completedTaskIds`, `filesAdded`, `filesModified`, `interfacesCreated`, `decisionsFromPriorWaves` (each capped to the most-recent N entries).
 
+<!-- fan-out-dispatch: await-barrier-required -->
 Dispatch with:
 - `model: <highest model among wave tasks>` — haiku if all tasks are Trivial; sonnet if any Standard; opus if any Complex.
 - `mode: bypassPermissions`
+- `run_in_background: false` — **required.** Subagents run in the background by default, and main context cannot proceed without the WAVE_SUMMARY, so this is an await barrier: never consolidate on a partial or absent return. (R-WAVE-BACKGROUND-DISPATCH, #506; R-orchestrator-await, #487)
 - **`model:` is REQUIRED — no exceptions.** Omitting it causes the wave-runner to inherit the parent model (opus), defeating the quality-tier system.
 - **DO NOT pass `isolation: "worktree"` (or any other `isolation` value) to the Agent tool.** execute-plan-sdlc never creates a git worktree (workspace is auto-detected `branch`/`continue`). The Agent SDK `isolation: "worktree"` parameter creates ephemeral `.claude/worktrees/agent-<id>` paths that break `.sdlc/` anchoring and cause commits to land in the wrong location. Implements R-no-agent-sdk-isolation from spec. See issues #370 #372. (Mirrors the R-agent-isolation-script-driven constraint in ship-sdlc/SKILL.md.)
 
@@ -458,6 +488,15 @@ The wave-runner Agent handles in-wave per-task fan-out internally — it dispatc
 
    - If `missingIds.length === 0 && schemaOk` → proceed to step 1. Per-task `status` and `filesTouched` (not `filesChanged`) come from `parsed.tasks[]`.
 
+   **TIMEOUT handling (R-WAVE-DEADLINE, #506):** When `WAVE_SUMMARY.status === "partial"` (any task carries `errorCode: "TIMEOUT"`):
+   - Record each terminated task via `task-fail --error TIMEOUT` — the task is accounted, not
+     missing, so the exit-65 gate stays meaningful.
+   - Write the wave-level state marker HERE, in main context: `wave-done --wave <N> --status partial --timed-out [--decisions '<json>']`. This IS this wave's Step 5d state write (R-main-context-steps assigns all state writes to main context — the wave-runner Agent never calls `state/execute.js` itself, it only returns `status: "partial"` in its bounded `WAVE_SUMMARY`). Do NOT also run the generic `wave-done` call below in Step 5d for this wave — it would default `--status` to `completed` and silently overwrite this partial/timed-out verdict.
+   - Surface one warning line: `Wave N exceeded executeWaveTimeout (<n>s) — <k> task(s) terminated.`
+   - Proceed to Step 6 (RECOVER) with those tasks. Do NOT halt the pipeline: timeout is a verdict,
+     matching `await-remote-review` and `verify-pipeline`, both of which exit 0 on timeout and let
+     the caller continue.
+
 1. **Filesystem verification (mandatory, always first):** Run `git diff --stat` in the main context. For each task in `WAVE_SUMMARY.tasks`, confirm that the files in `filesTouched` (R-FILESTOUCHED) actually appear in the diff. If the wave-runner reported success for a task but `git diff --stat` shows no changes to its expected files, classify this as a **phantom success** (see Step 6).
 
    **1a. `expectedFiles` cross-check (Fixes #392 / R34) — IN ADDITION to step 1, not a replacement.** Compute `diffFiles` from the same `git diff --stat` output (the file set with non-zero `+/-` lines). Compute `expectedSet = wave.expectedFiles` from the wave manifest.
@@ -467,7 +506,7 @@ The wave-runner Agent handles in-wave per-task fan-out internally — it dispatc
 
    This check augments — never replaces — the per-task `filesTouched` check in step 1. They guard different invariants: step 1 catches per-task agent drift; step 1a catches wave-level scope drift (agent touched files outside what the plan declared).
 
-2. **Canary check per task:** For each task with a `verifyToken` in the `WAVE_SUMMARY`, grep in the main context for the symbol (`VERIFY: <symbol> in <file>`). This catches cases where `git diff` shows the file changed but the actual edits were incomplete or overwritten.
+2. **Canary check per task (R-WAVE-CONTEXT-PRODUCER, #506; mandatory per R9):** For each task whose `status` is `DONE` or `DONE_WITH_CONCERNS`, `WAVE_SUMMARY.tasks[].verifyToken` MUST be present — grep in the main context for the symbol (`VERIFY: <symbol> in <file>`). A missing `verifyToken` for such a task is itself a failure (treat as phantom success, same escalation path as Step 6) — a `DONE` verdict claims a successful change, and the canary is the only path back from the wave-runner that confirms it. Tasks whose `status` is `NEEDS_CONTEXT`, `BLOCKED`, or `FAILED` are exempt — no successful change is claimed for them, so there is nothing for the canary to verify. This catches cases where `git diff` shows the file changed but the actual edits were incomplete or overwritten.
 
 3. **Conflict detection:** Check `git diff --stat` for files touched by multiple tasks in this wave. If found, treat as a file conflict.
 
@@ -476,7 +515,7 @@ The wave-runner Agent handles in-wave per-task fan-out internally — it dispatc
 5. **Task status handling** (from `WAVE_SUMMARY.tasks[].status`):
    - STATUS: DONE → proceed normally
    - STATUS: DONE_WITH_CONCERNS → read the concerns; if about correctness, investigate before proceeding; if observational, note and continue
-   - STATUS: NEEDS_CONTEXT or BLOCKED → re-dispatch a fresh wave-runner Agent scoped to only the failing tasks, passing previous `attempts[]` and errors (counts as one wave-level retry toward the 2-retry budget). The recovery wave-runner inherits the previous `attempts[]` for each failing task; its per-task retry budget is reduced by the attempts already consumed (e.g., if a task already used 2 retries inside the original wave-runner, the recovery wave-runner receives 0 remaining per-task retries for that task and must escalate immediately). This prevents a FAILED task from receiving a fresh budget via re-dispatch.
+   - STATUS: NEEDS_CONTEXT or BLOCKED → re-dispatch a fresh wave-runner Agent scoped to only the failing tasks, passing the recorded errors (counts as one wave-level retry toward the wave's 2-retry budget). Attempt counts are NOT tracked in state or returned in `WAVE_SUMMARY` (`attempts[]` was removed from the bounded output schema, per R-BOUNDED-RETURN) — this recovery re-dispatch, like every wave-runner dispatch, applies a fresh per-task budget of 2 retries scoped to itself; there is no cross-dispatch attempt inheritance. What actually bounds a repeatedly-failing task is the wave-level retry budget tracked here in main context: once this wave has exhausted its 2 wave-level retries, escalate per Step 6 rather than re-dispatching again.
    - STATUS: FAILED (after 2 retries inside wave-runner) → apply recovery from Step 6
 
 6. On any failure → apply recovery from Step 6.
@@ -571,7 +610,7 @@ Running verification... [status]
 Proceeding to Wave N+1 (N tasks)
 ```
 
-The progress report is rendered from `WAVE_SUMMARY` payload — per-task names, statuses, and `filesTouched` (R-FILESTOUCHED) from the summary. State writes happen after wave-runner returns and main-context verification completes.
+The progress report is rendered from `WAVE_SUMMARY` payload — per-task names, statuses, and `filesTouched` (R-FILESTOUCHED) from the summary. Per-wave state writes (`task-done`/`task-fail`, `wave-done`/`wave-fail`) happen after wave-runner returns and main-context verification completes. **Exception:** `init` and the one-time `context --data` call below are bootstrap writes that run once, before wave 1's 5a-pre — see "First-wave bootstrap" above — not after any wave-runner return.
 
 **State persistence:** After each wave completes, update the execution state via `state/execute.js`. Locate the script:
 ```bash
@@ -587,12 +626,31 @@ Where `<json-array-of-all-task-ids>` is a JSON array of every task ID from the p
 
 `--plan-path`/`--plan-hash` (implements R40): `$PLAN_FILE` is the absolute path stored in Step 1 (LOAD). The hash is computed HERE, in the skill, with `shasum -a 256` over the plan file's actual bytes — `state/execute.js` stays a pure recorder and does not compute or validate the hash itself. Passing both flags is what makes the resume-time plan-hash mismatch check (Step 0, R15) reachable: without them the state file always recorded `planPath: null` / `planHash: null` and the check could never fire.
 
-Before each wave: `node "$STATE_SCRIPT" wave-start --wave <N>`
-After each task (sourced from `WAVE_SUMMARY.tasks[]`): `node "$STATE_SCRIPT" task-done --wave <N> --task <id> --name "<name>" --complexity <c> --risk <r> --files-changed '<json>'` where `<json>` is `WAVE_SUMMARY.tasks[].filesTouched` (R-FILESTOUCHED) (or `task-fail` when `task.status === 'FAILED'`)
-After each wave: `node "$STATE_SCRIPT" wave-done --wave <N>` (or `wave-fail` when `WAVE_SUMMARY.status === 'failed'`)
-Update context: `node "$STATE_SCRIPT" context --data '<json>'`
+Before each wave: `node "$STATE_SCRIPT" wave-start --wave <N> --tasks-json '<json-array-of-task-objects>'` — this is the same call made in 5b (above) to obtain fact sheets and `runId`; it is not repeated here as a second invocation.
+After each task (sourced from `WAVE_SUMMARY.tasks[]`): `node "$STATE_SCRIPT" task-done --wave <N> --task <id> --name "<name>" --complexity <c> --risk <r> --files-changed '<json>' [--files-added '<json>'] [--verify-token '<json>']` (or `task-fail` when `task.status === 'FAILED'`)
+After each wave: branch on `WAVE_SUMMARY.status`:
+- `"partial"` (timeout) → already handled above in the TIMEOUT handling block (`wave-done --status partial --timed-out`) — do not call `wave-done` again here.
+- `"failed"` → `node "$STATE_SCRIPT" wave-fail --wave <N>`
+- otherwise (`"completed"`) → `node "$STATE_SCRIPT" wave-done --wave <N> [--decisions '<json>']`
 
-The `state/execute.js` CLI surface is unchanged — only the SKILL.md call-site shape shifts (writes happen after wave-runner returns, driven by `WAVE_SUMMARY` data, but with the same arguments).
+**Producer-chain flag sources (R-WAVE-CONTEXT-PRODUCER, #506).** Every flag below is filled from a named `WAVE_SUMMARY` field — never from git, never from inference:
+
+| Flag | Sourced from |
+|---|---|
+| `--files-changed` | `WAVE_SUMMARY.tasks[].filesTouched` (unchanged) |
+| `--files-added` | `WAVE_SUMMARY.tasks[].filesAdded` — omit the flag when the field is absent; do NOT substitute `filesTouched` |
+| `--verify-token` | `WAVE_SUMMARY.tasks[].verifyToken` concatenated with `.interfaces[]`, deduplicated, as a JSON array |
+| `wave-done --decisions` | the union of `WAVE_SUMMARY.tasks[].decisions[]` across the wave, as a JSON array |
+
+These call sites are the *only* consumers of `filesAdded`, `interfaces`, and `decisions` — those three `WAVE_SUMMARY` fields exist for this wiring and for nothing else. `filesTouched` remains cited by name for `--files-changed` (R-FILESTOUCHED).
+
+Update context (R-WAVE-CONTEXT-PRODUCER, #506): `filesAdded`, `filesModified`, `interfacesCreated`, and `completedTaskIds` are written automatically by `task-done`; `decisionsFromPriorWaves` by `wave-done --decisions`. The `context` verb is used ONLY for `planSummary`, once, immediately after the `init` call above (NOT after Step 1/LOAD — `context` requires an existing state file, and `init` is what creates it; calling `context` any earlier exits 1 with "no state file found"):
+```bash
+node "$STATE_SCRIPT" context --data '{"planSummary":"<2-3 sentence goal of the plan>"}'
+```
+The verb rejects unknown keys, non-objects, and empty objects with exit 2 — it is no longer a silent no-op.
+
+The `state/execute.js` verb surface is unchanged — only the SKILL.md call-site shape shifts (writes happen after wave-runner returns, driven by `WAVE_SUMMARY` data), plus the optional `--files-added` / `--verify-token` / `--decisions` flags documented in the table above.
 
 On successful completion: `node "$STATE_SCRIPT" cleanup`
 
