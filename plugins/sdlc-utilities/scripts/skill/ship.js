@@ -37,12 +37,11 @@
 
 const fs   = require('fs');
 const path = require('path');
-const os   = require('os');
 const { spawnSync } = require('child_process');
 const LIB = path.join(__dirname, '..', 'lib');
 
 const { exec, checkGitState, detectBaseBranch, deriveWorkspace, parseRemoteOwner, probeGhAuth, formatAccountMismatch, probeRepoAccess, formatAccessDenied, getTagList } = require(path.join(LIB, 'git'));
-const { resolveMainWorktree, detectResumeState: detectResumeStateLib, readState, slugifyBranch } = require(path.join(LIB, 'state'));
+const { resolveMainWorktree, detectResumeState: detectResumeStateLib, readState, slugifyBranch, claimSession } = require(path.join(LIB, 'state'));
 const { readSection, resolveSdlcRoot } = require(path.join(LIB, 'config'));
 const { writeOutput } = require(path.join(LIB, 'output'));
 const { resolveSkipConfigCheck, ensureConfigVersion } = require(path.join(LIB, 'config-version-prepare'));
@@ -88,7 +87,7 @@ function parseArgs(argv) {
   // when no state file is found, the hook variant surfaces a structured
   // `implicitResumeNoState` error rather than silently starting fresh.
   let hookActivePipeline = false;
-  // R-PLANFILE: optional path to the active plan markdown (overrides plansDirectory scan)
+  // R-PLANFILE/R72: path to the active plan markdown, sourced solely from an explicit --plan
   let planFile = null;
   const errors = [];
 
@@ -144,7 +143,7 @@ function parseArgs(argv) {
       } else {
         ttlDays = v;
       }
-    } else if (a === '--plan-file' && args[i + 1]) {
+    } else if (a === '--plan' && args[i + 1]) {
       planFile = args[++i];
     } else if (a === '--hook-active-pipeline') {
       hookActivePipeline = true;
@@ -446,15 +445,20 @@ function computeSteps(flags, flagSources, { openspecContext, expectedBranch, pla
         // final feature commit subsumes per-wave WIP commits cleanly
         // (Fixes #392 / R35).
         flags.executeCommitWaves ? '--commit-waves' : '',
-        // R-PLANFILE: forward resolved plan file so execute-plan-sdlc skips
-        // conversation-context discovery (fragile under compaction).
-        planFile ? `--plan-file "${planFile}"` : '',
+        // R-PLANFILE: forward the resolved plan file explicitly so
+        // execute-plan-sdlc never has to infer it from conversation context
+        // (fragile under compaction) — resolution is CLI-only (R72).
+        planFile ? `--plan "${planFile}"` : '',
+        // Forward --auto so the plan-hash mismatch branch (R15) has a
+        // deterministic non-interactive default under ship dispatch,
+        // mirroring the resume-prompt's existing --auto handling.
+        flags.auto ? '--auto' : '',
       ].filter(Boolean).join(' '),
       reason: !flags.hasPlan
-        ? 'no plan in context'
+        ? 'no plan (--has-plan not set)'
         : !isIn('execute')
           ? 'not in steps[]'
-          : 'plan detected in context',
+          : 'plan available (--has-plan set)',
       pause: false,
       isolation: null,
       dispatchMode: 'agent',
@@ -902,6 +906,22 @@ function runValidation(flags, flagSources, steps, context) {
     errors.push('All steps are skipped. At least one step must run.');
   }
 
+  // R72/C19 (#505): explicit-only plan resolution. Keyed on the RESOLVED step
+  // list containing an execute step that will actually run — not on the raw
+  // --has-plan flag — because step membership is what actually decides
+  // whether a plan gets implemented.
+  const executeWillRun = steps.some(s => s.name === 'execute' && s.status === 'will_run');
+  if (!context.planFile && executeWillRun) {
+    errors.push({
+      id: 'missingPlanFile',
+      message:
+        'ship-sdlc cannot run the "execute" step without a plan document. ' +
+        'Fix: re-run with --plan <path-to-plan.md>. ' +
+        'Why: plan autodiscovery was removed (#505). It picked the most recently modified *.md in ~/.claude/plans/, which is shared across repositories — it could hand this repo a plan written for a different one and implement it here. ' +
+        'If you did not mean to run execute, drop --has-plan (or omit execute from --steps) and the pipeline will skip it.',
+    });
+  }
+
   // --bump without version step (only error when user explicitly set bump on
   // the CLI — config-level/default bump is just a no-op when version is
   // excluded from steps[]).
@@ -1031,6 +1051,28 @@ function verifySideEffect(argv) {
 }
 
 // ---------------------------------------------------------------------------
+// Fatal error stderr mirror
+// ---------------------------------------------------------------------------
+
+/**
+ * R72: writeOutput() writes the result JSON to a temp file and prints ONLY
+ * that file path to stdout — nothing human-readable reaches the terminal on
+ * failure. Mirror every fatal error to stderr, one block per error, so a
+ * plain `node ship.js ...` run in a terminal shows the remediation text
+ * instead of just a temp-file path and a bare exit code.
+ *
+ * `errors[]` mixes bare strings (legacy validations) and structured
+ * `{id, message}` objects (R72 and other newer checks) — handle both.
+ *
+ * @param {Array<string|{id: string, message: string}>} errors
+ */
+function writeFatalErrors(errors) {
+  if (!Array.isArray(errors) || errors.length === 0) return;
+  const blocks = errors.map(e => (typeof e === 'string' ? e : e.message));
+  process.stderr.write(blocks.join('\n\n') + '\n');
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1066,6 +1108,7 @@ function main() {
   let migrationManifest = { ...(cv.migration || {}), infrastructure: cv.infrastructure };
   if (cv.errors.length > 0) {
     for (const e of cv.errors) errors.push(`config-version: ${e.role}: ${e.message}`);
+    writeFatalErrors(errors);
     writeOutput({
       errors,
       warnings,
@@ -1084,6 +1127,7 @@ function main() {
   // entirely. Emit {action: "gc", report, errors, warnings} and exit.
   if (cli.gc) {
     if (errors.length > 0) {
+      writeFatalErrors(errors);
       writeOutput({ action: 'gc', errors, warnings }, 'ship-prepare', 1);
       return;
     }
@@ -1121,6 +1165,7 @@ function main() {
       report = { ttlDays, ship, execute, plan, commit, exploreTempdirs };
     } catch (err) {
       errors.push(`gc failed: ${err.message}`);
+      writeFatalErrors(errors);
       writeOutput({ action: 'gc', errors, warnings }, 'ship-prepare', 1);
       return;
     }
@@ -1160,6 +1205,7 @@ function main() {
     gitState = checkGitState(process.cwd());
   } catch (err) {
     errors.push(err.message);
+    writeFatalErrors(errors);
     writeOutput({ errors, warnings }, 'ship-prepare', 1);
     return;
   }
@@ -1200,6 +1246,7 @@ function main() {
     defaultBranch = detectBaseBranch(projectRoot);
   } catch (err) {
     errors.push(err.message);
+    writeFatalErrors(errors);
     writeOutput({ errors, warnings }, 'ship-prepare', 1);
     return;
   }
@@ -1314,61 +1361,38 @@ function main() {
   }
 
   // Build context
-  // R-PLANFILE: resolve the active plan file path for execute-step task mirroring.
-  // Priority: (1) CLI --plan-file flag, (2) project .claude/settings.json plansDirectory,
-  // (3) global ~/.claude/settings.json plansDirectory, (4) default ~/.claude/plans/ (most recent *.md).
-  // Returns absolute path string or null if no plan file can be found.
-  function resolvePlanFile(cliPlanFile) {
-    if (cliPlanFile) {
-      return path.resolve(cliPlanFile);
+  // R72/C19: the plan file is explicit-only. No plansDirectory scan, no mtime
+  // heuristic — a global ~/.claude/plans/ is cross-repo, so "newest *.md" could
+  // select a plan written for a different repository and implement it here (#505).
+  function resolvePlanFile(cliPlanFile, errors) {
+    if (!cliPlanFile) return null;
+    const resolved = path.resolve(cliPlanFile);
+    let stat = null;
+    try { stat = fs.statSync(resolved); } catch { /* missing */ }
+    if (!stat || !stat.isFile()) {
+      errors.push({
+        id: 'planFileNotFound',
+        message:
+          `--plan "${cliPlanFile}" does not exist. ` +
+          `Resolved to: ${resolved}. ` +
+          `Fix: check the path, or run /plan-sdlc first to produce one.`,
+      });
+      return null;
     }
-
-    const candidateDirs = [];
-
-    // Project settings (takes precedence)
-    const projectSettings = path.join(projectRoot, '.claude', 'settings.json');
-    if (fs.existsSync(projectSettings)) {
-      try {
-        const s = JSON.parse(fs.readFileSync(projectSettings, 'utf8'));
-        if (s.plansDirectory) candidateDirs.push(s.plansDirectory);
-      } catch (_) { /* ignore */ }
+    if (!resolved.endsWith('.md')) {
+      errors.push({
+        id: 'planFileNotMarkdown',
+        message:
+          `--plan must point at a .md plan document. ` +
+          `Got: ${resolved}. ` +
+          `Fix: pass the plan markdown itself, not its directory or a state file.`,
+      });
+      return null;
     }
-
-    // Global settings
-    const globalSettings = path.join(os.homedir(), '.claude', 'settings.json');
-    if (fs.existsSync(globalSettings)) {
-      try {
-        const s = JSON.parse(fs.readFileSync(globalSettings, 'utf8'));
-        if (s.plansDirectory) candidateDirs.push(s.plansDirectory);
-      } catch (_) { /* ignore */ }
-    }
-
-    // Default fallback
-    candidateDirs.push(path.join(os.homedir(), '.claude', 'plans'));
-
-    for (const dir of candidateDirs) {
-      if (!fs.existsSync(dir)) continue;
-      try {
-        const entries = fs.readdirSync(dir)
-          .filter(f => f.endsWith('.md'))
-          .map(f => {
-            try {
-              const stat = fs.statSync(path.join(dir, f));
-              return { name: f, mtime: stat.mtimeMs };
-            } catch (_) { return null; }
-          })
-          .filter(Boolean)
-          .sort((a, b) => b.mtime - a.mtime);
-        if (entries.length > 0) {
-          return path.join(dir, entries[0].name);
-        }
-      } catch (_) { continue; }
-    }
-
-    return null;
+    return resolved;
   }
 
-  const planFile = resolvePlanFile(cli.planFile || null);
+  const planFile = resolvePlanFile(cli.planFile || null, errors);
 
   const context = {
     currentBranch: gitState.currentBranch,
@@ -1419,10 +1443,18 @@ function main() {
   // The implicitResume marker lets SKILL.md / state lifecycle distinguish
   // this from an explicit --resume request.
   let implicitResume = false;
+  // R73/#505: claimSession() re-stamps sessionId on the resumed state file so
+  // hookEnforcementAllowed() tracks the session actually driving this resume
+  // rather than whichever session originally created the pipeline. Gated on
+  // errors.length === 0 so a run that is about to hard-error (e.g. R72
+  // missingPlanFile) never mutates the state file it is refusing to run.
   if (resume && resume.found && resume.fresh && !cli.resume) {
     implicitResume = true;
     flags.resume = true;
     flagSources.resume = 'implicit';
+    if (errors.length === 0) claimSession('ship', slugifyBranch(gitState.currentBranch));
+  } else if (cli.resume && resume && resume.found && errors.length === 0) {
+    claimSession('ship', slugifyBranch(gitState.currentBranch));
   }
   flags.implicitResume = implicitResume;
 
@@ -1517,6 +1549,7 @@ function main() {
 
   // Exit with 1 if there are fatal errors, 0 otherwise
   const exitCode = errors.length > 0 ? 1 : 0;
+  writeFatalErrors(errors);
   writeOutput(result, 'ship-prepare', exitCode);
 }
 
